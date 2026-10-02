@@ -721,9 +721,42 @@ async def on_ready():
         log.exception("Failed to sync slash commands")
 
 
+def find_sticker(guild: discord.Guild | None, name: str) -> discord.GuildSticker | None:
+    if not guild:
+        return None
+    for s in guild.stickers:
+        if s.name.lower() == name.lower():
+            return s
+    return None
+
+
+async def handle_x67(message: discord.Message):
+    """x67 / x69 trigger — a joke, not a real spot call. Picks either the
+    actual 'x67' server sticker (if this server has one by that name) or one
+    of the text roasts, all with equal odds."""
+    sticker = find_sticker(message.guild, "x67")
+    choices: list[str | discord.GuildSticker] = list(X67_TEXT_ROASTS)
+    if sticker:
+        choices.append(sticker)
+
+    pick = random.choice(choices)
+    if isinstance(pick, discord.GuildSticker):
+        try:
+            await message.channel.send(stickers=[pick])
+        except discord.HTTPException:
+            await message.channel.send(random.choice(X67_TEXT_ROASTS))
+    else:
+        await message.channel.send(pick)
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
+        return
+
+    content_check = message.content.strip().lower()
+    if content_check in ("x67", "x69"):
+        await handle_x67(message)
         return
 
     channel_id = message.channel.id
@@ -1141,6 +1174,19 @@ ALREADY_SHUFFLED_ROASTS = [
     "Congrats, you just tried to shuffle a race that's already done. Go touch grass and chill the fuck out.",
     "**{code}** already shuffled. This isn't a double-tap situation. Relax.",
     "We heard you the first time. **{code}** is shuffled. Chill the fuck out.",
+]
+
+X67_TEXT_ROASTS = [
+    "WHAT. NO. I'm not a whale, chill. 😂",
+    "Bro really tried to give me 67 spots. Absolutely not.",
+    "Sir this is a duck race, not a timeshare. NO.",
+    "I said WHAT. I don't want that many. Chill tf out.",
+    "67?? 69?? Pick a number that isn't unhinged.",
+    "Not me getting assigned that many spots. Absolutely not today, Satan.",
+    "I'm good on the 15-spot starter pack, thanks though 😂",
+    "Bro thinks I'm made of money. I am not. NO.",
+    "That's a hard pass. Try again with a normal number.",
+    "Respectfully: absolutely the hell not.",
 ]
 
 ONE_ON_13_ROASTS = [
