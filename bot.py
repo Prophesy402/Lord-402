@@ -731,9 +731,10 @@ def find_sticker(guild: discord.Guild | None, name: str) -> discord.GuildSticker
 
 
 async def handle_x67(message: discord.Message):
-    """x67 / x69 trigger — a joke, not a real spot call. Picks either the
-    actual 'x67' server sticker (if this server has one by that name) or one
-    of the text roasts, all with equal odds."""
+    """x67 / x69 trigger — posts a joke reaction (the server's 'x67' sticker,
+    if it has one, or one of the text roasts, all with equal odds) as flavor.
+    This does NOT decide whether the spots get called — that still happens
+    normally via SPOT_CALL_RE right after this runs."""
     sticker = find_sticker(message.guild, "x67")
     choices: list[str | discord.GuildSticker] = list(X67_TEXT_ROASTS)
     if sticker:
@@ -757,7 +758,10 @@ async def on_message(message: discord.Message):
     content_check = message.content.strip().lower()
     if content_check in ("x67", "x69"):
         await handle_x67(message)
-        return
+        # Don't return here — x67/x69 are still real spot calls (for 67 and 69
+        # spots respectively, clamped to whatever's left). The roast/sticker
+        # above is just flavor; the call itself falls through to the normal
+        # SPOT_CALL_RE handling below.
 
     channel_id = message.channel.id
     race = get_race(channel_id)
@@ -997,7 +1001,7 @@ async def duck_open(
         return
 
     if notes and notes.strip():
-        await thread.send(f"📋 **Host notes:** {notes.strip()}")
+        await thread.send(f"📋 **Host notes ({interaction.user.display_name}):** {notes.strip()}")
 
     save_race(thread.id, race)
 
@@ -1123,7 +1127,7 @@ async def duck_open_sat(
         return
 
     if notes and notes.strip():
-        await thread.send(f"📋 **Host notes:** {notes.strip()}")
+        await thread.send(f"📋 **Host notes ({interaction.user.display_name}):** {notes.strip()}")
 
     save_race(thread.id, sat_race)
 
