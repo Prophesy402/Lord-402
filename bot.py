@@ -714,6 +714,13 @@ async def run_race_shuffle(
 # ---------- bot lifecycle ----------
 
 @bot.event
+async def setup_hook():
+    # Re-attach the persistent Edit-notes button so it keeps working on
+    # notes messages posted before a restart.
+    bot.add_view(NotesEditView())
+
+
+@bot.event
 async def on_ready():
     log.info("Logged in as %s (id=%s)", bot.user, bot.user.id if bot.user else "?")
     try:
@@ -888,6 +895,102 @@ async def _run_spot_call_countdown(thread: discord.abc.Messageable, seconds: int
             pass
 
 
+# ---------- host notes (editable via button or /duck notes) ----------
+
+NOTES_MAX_LENGTH = 1800
+
+
+def _notes_text(race: dict, fallback_author: str) -> str:
+    author = race.get("notes_author") or fallback_author
+    return f"📋 **Host notes ({author}):** {race['notes']}"
+
+
+def _can_edit_notes(interaction: discord.Interaction, race: dict) -> bool:
+    is_admin = (
+        isinstance(interaction.user, discord.Member)
+        and interaction.user.guild_permissions.administrator
+    )
+    return is_admin or str(interaction.user.id) == race["opened_by"]
+
+
+async def _post_notes(thread: discord.abc.Messageable, race: dict, notes: str, author: str):
+    """Posts the host-notes message with its Edit button and records it on the race."""
+    race["notes"] = notes
+    race["notes_author"] = author
+    notes_message = await thread.send(_notes_text(race, author), view=NotesEditView())
+    race["notes_message_id"] = str(notes_message.id)
+
+
+async def update_race_notes(interaction: discord.Interaction, race: dict, notes: str):
+    """Edits the existing notes message in place, or posts a fresh one if it's gone.
+    Responds to the interaction either way."""
+    race["notes"] = notes
+    new_text = _notes_text(race, interaction.user.display_name)
+
+    edited = False
+    notes_message_id = race.get("notes_message_id")
+    if notes_message_id and isinstance(interaction.channel, (discord.Thread, discord.TextChannel)):
+        try:
+            existing = await interaction.channel.fetch_message(int(notes_message_id))
+            await existing.edit(content=new_text, view=NotesEditView())
+            edited = True
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            edited = False
+
+    await interaction.response.send_message("✅ Notes updated.", ephemeral=True)
+    if not edited:
+        # Original notes message is gone or was never posted — post a fresh one
+        # and track that as the editable notes message going forward.
+        await _post_notes(interaction.channel, race, notes, race.get("notes_author") or interaction.user.display_name)
+    save_race(interaction.channel_id, race)
+
+
+class NotesModal(discord.ui.Modal, title="Edit host notes"):
+    def __init__(self, current: str):
+        super().__init__()
+        self.notes_input = discord.ui.TextInput(
+            label="Notes",
+            style=discord.TextStyle.paragraph,
+            default=current[:NOTES_MAX_LENGTH],
+            max_length=NOTES_MAX_LENGTH,
+        )
+        self.add_item(self.notes_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        race = get_race(interaction.channel_id)
+        if not race:
+            await interaction.response.send_message("No race is set up in this channel.", ephemeral=True)
+            return
+        notes = self.notes_input.value.strip()
+        if not notes:
+            await interaction.response.send_message("Notes can't be blank.", ephemeral=True)
+            return
+        await update_race_notes(interaction, race, notes)
+
+
+class NotesEditView(discord.ui.View):
+    """Persistent Edit button under the host-notes message. The race is looked up
+    by channel, so one fixed custom_id works for every thread and survives restarts."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Edit notes", emoji="✏️", style=discord.ButtonStyle.secondary,
+                       custom_id="duckbot:edit_notes")
+    async def edit_notes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        race = get_race(interaction.channel_id)
+        if not race:
+            await interaction.response.send_message("No race is set up in this channel.", ephemeral=True)
+            return
+        if not _can_edit_notes(interaction, race):
+            await interaction.response.send_message(
+                "Only the host who opened this race, or an admin, can edit the notes.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(NotesModal(race.get("notes") or ""))
+
+
 @create_group.command(name="race", description="Open a new duck race in this channel")
 @app_commands.describe(
     code="Short race code, e.g. ER13",
@@ -970,11 +1073,7 @@ async def duck_open(
         return
 
     if notes and notes.strip():
-        notes_message = await thread.send(
-            f"📋 **Host notes ({interaction.user.display_name}):** {notes.strip()}"
-        )
-        race["notes"] = notes.strip()
-        race["notes_message_id"] = str(notes_message.id)
+        await _post_notes(thread, race, notes.strip(), interaction.user.display_name)
 
     save_race(thread.id, race)
 
@@ -1100,11 +1199,7 @@ async def duck_open_sat(
         return
 
     if notes and notes.strip():
-        notes_message = await thread.send(
-            f"📋 **Host notes ({interaction.user.display_name}):** {notes.strip()}"
-        )
-        sat_race["notes"] = notes.strip()
-        sat_race["notes_message_id"] = str(notes_message.id)
+        await _post_notes(thread, sat_race, notes.strip(), interaction.user.display_name)
 
     save_race(thread.id, sat_race)
 
@@ -1364,12 +1459,7 @@ async def duck_notes(interaction: discord.Interaction, notes: str):
         await interaction.response.send_message("No race is set up in this channel.", ephemeral=True)
         return
 
-    is_admin = (
-        isinstance(interaction.user, discord.Member)
-        and interaction.user.guild_permissions.administrator
-    )
-    is_host = str(interaction.user.id) == race["opened_by"]
-    if not (is_host or is_admin):
+    if not _can_edit_notes(interaction, race):
         await interaction.response.send_message(
             "Only the host who opened this race, or an admin, can edit the notes.",
             ephemeral=True,
@@ -1380,30 +1470,7 @@ async def duck_notes(interaction: discord.Interaction, notes: str):
         await interaction.response.send_message("Notes can't be blank.", ephemeral=True)
         return
 
-    new_text = f"📋 **Host notes ({interaction.user.display_name}):** {notes.strip()}"
-
-    edited = False
-    notes_message_id = race.get("notes_message_id")
-    if notes_message_id and isinstance(interaction.channel, (discord.Thread, discord.TextChannel)):
-        try:
-            existing = await interaction.channel.fetch_message(int(notes_message_id))
-            await existing.edit(content=new_text)
-            edited = True
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            edited = False
-
-    if edited:
-        race["notes"] = notes.strip()
-        save_race(interaction.channel_id, race)
-        await interaction.response.send_message("✅ Notes updated.", ephemeral=True)
-    else:
-        # Original notes message is gone or was never posted — post a fresh one
-        # and track that as the editable notes message going forward.
-        await interaction.response.send_message("✅ Notes updated.", ephemeral=True)
-        posted = await interaction.channel.send(new_text)
-        race["notes"] = notes.strip()
-        race["notes_message_id"] = str(posted.id)
-        save_race(interaction.channel_id, race)
+    await update_race_notes(interaction, race, notes.strip()[:NOTES_MAX_LENGTH])
 
 
 bot.tree.add_command(duck_group)
