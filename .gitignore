@@ -1,0 +1,11 @@
+# Secrets
+.env
+
+# Runtime race state written by the bot
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
