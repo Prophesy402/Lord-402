@@ -132,6 +132,8 @@ def new_race(
         "sat_thread_id": None,    # id of the linked satellite race's thread, while active
         "is_sat": False,          # True if THIS race is itself a satellite race
         "sat_parent_id": None,    # if is_sat, the channel/thread id of the race it feeds into
+        "notes": None,             # current host-notes text, if any
+        "notes_message_id": None,  # id of the "Host notes" message in the thread, for editing
     }
 
 
@@ -721,47 +723,14 @@ async def on_ready():
         log.exception("Failed to sync slash commands")
 
 
-def find_sticker(guild: discord.Guild | None, name: str) -> discord.GuildSticker | None:
-    if not guild:
-        return None
-    for s in guild.stickers:
-        if s.name.lower() == name.lower():
-            return s
-    return None
-
-
-async def handle_x67(message: discord.Message):
-    """x67 / x69 trigger — posts a joke reaction (the server's 'x67' sticker,
-    if it has one, or one of the text roasts, all with equal odds) as flavor.
-    This does NOT decide whether the spots get called — that still happens
-    normally via SPOT_CALL_RE right after this runs."""
-    sticker = find_sticker(message.guild, "x67")
-    choices: list[str | discord.GuildSticker] = list(X67_TEXT_ROASTS)
-    if sticker:
-        choices.append(sticker)
-
-    pick = random.choice(choices)
-    if isinstance(pick, discord.GuildSticker):
-        try:
-            await message.channel.send(stickers=[pick])
-        except discord.HTTPException:
-            await message.channel.send(random.choice(X67_TEXT_ROASTS))
-    else:
-        await message.channel.send(pick)
-
-
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    content_check = message.content.strip().lower()
-    if content_check in ("x67", "x69"):
-        await handle_x67(message)
-        # Don't return here — x67/x69 are still real spot calls (for 67 and 69
-        # spots respectively, clamped to whatever's left). The roast/sticker
-        # above is just flavor; the call itself falls through to the normal
-        # SPOT_CALL_RE handling below.
+    # x67/x69 are just real spot calls (67 and 69 spots respectively, clamped
+    # to whatever's left) — handled by the normal SPOT_CALL_RE matching below,
+    # with no extra roast/sticker response.
 
     channel_id = message.channel.id
     race = get_race(channel_id)
@@ -1001,7 +970,11 @@ async def duck_open(
         return
 
     if notes and notes.strip():
-        await thread.send(f"📋 **Host notes ({interaction.user.display_name}):** {notes.strip()}")
+        notes_message = await thread.send(
+            f"📋 **Host notes ({interaction.user.display_name}):** {notes.strip()}"
+        )
+        race["notes"] = notes.strip()
+        race["notes_message_id"] = str(notes_message.id)
 
     save_race(thread.id, race)
 
@@ -1127,7 +1100,11 @@ async def duck_open_sat(
         return
 
     if notes and notes.strip():
-        await thread.send(f"📋 **Host notes ({interaction.user.display_name}):** {notes.strip()}")
+        notes_message = await thread.send(
+            f"📋 **Host notes ({interaction.user.display_name}):** {notes.strip()}"
+        )
+        sat_race["notes"] = notes.strip()
+        sat_race["notes_message_id"] = str(notes_message.id)
 
     save_race(thread.id, sat_race)
 
@@ -1178,19 +1155,6 @@ ALREADY_SHUFFLED_ROASTS = [
     "Congrats, you just tried to shuffle a race that's already done. Go touch grass and chill the fuck out.",
     "**{code}** already shuffled. This isn't a double-tap situation. Relax.",
     "We heard you the first time. **{code}** is shuffled. Chill the fuck out.",
-]
-
-X67_TEXT_ROASTS = [
-    "WHAT. NO. I'm not a whale, chill. 😂",
-    "Bro really tried to give me 67 spots. Absolutely not.",
-    "Sir this is a duck race, not a timeshare. NO.",
-    "I said WHAT. I don't want that many. Chill tf out.",
-    "67?? 69?? Pick a number that isn't unhinged.",
-    "Not me getting assigned that many spots. Absolutely not today, Satan.",
-    "I'm good on the 15-spot starter pack, thanks though 😂",
-    "Bro thinks I'm made of money. I am not. NO.",
-    "That's a hard pass. Try again with a normal number.",
-    "Respectfully: absolutely the hell not.",
 ]
 
 ONE_ON_13_ROASTS = [
@@ -1390,6 +1354,56 @@ async def duck_reset(interaction: discord.Interaction):
     save_race(interaction.channel_id, None)
     _result_buffers.pop(interaction.channel_id, None)
     await interaction.response.send_message(f"Race {race['code']} cleared. Channel ready for `/create race`.")
+
+
+@duck_group.command(name="notes", description="Edit the host notes for the race in this thread")
+@app_commands.describe(notes="The new host notes text — replaces whatever was posted before")
+async def duck_notes(interaction: discord.Interaction, notes: str):
+    race = get_race(interaction.channel_id)
+    if not race:
+        await interaction.response.send_message("No race is set up in this channel.", ephemeral=True)
+        return
+
+    is_admin = (
+        isinstance(interaction.user, discord.Member)
+        and interaction.user.guild_permissions.administrator
+    )
+    is_host = str(interaction.user.id) == race["opened_by"]
+    if not (is_host or is_admin):
+        await interaction.response.send_message(
+            "Only the host who opened this race, or an admin, can edit the notes.",
+            ephemeral=True,
+        )
+        return
+
+    if not notes.strip():
+        await interaction.response.send_message("Notes can't be blank.", ephemeral=True)
+        return
+
+    new_text = f"📋 **Host notes ({interaction.user.display_name}):** {notes.strip()}"
+
+    edited = False
+    notes_message_id = race.get("notes_message_id")
+    if notes_message_id and isinstance(interaction.channel, (discord.Thread, discord.TextChannel)):
+        try:
+            existing = await interaction.channel.fetch_message(int(notes_message_id))
+            await existing.edit(content=new_text)
+            edited = True
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            edited = False
+
+    if edited:
+        race["notes"] = notes.strip()
+        save_race(interaction.channel_id, race)
+        await interaction.response.send_message("✅ Notes updated.", ephemeral=True)
+    else:
+        # Original notes message is gone or was never posted — post a fresh one
+        # and track that as the editable notes message going forward.
+        await interaction.response.send_message("✅ Notes updated.", ephemeral=True)
+        posted = await interaction.channel.send(new_text)
+        race["notes"] = notes.strip()
+        race["notes_message_id"] = str(posted.id)
+        save_race(interaction.channel_id, race)
 
 
 bot.tree.add_command(duck_group)
