@@ -713,7 +713,7 @@ async def run_race_shuffle(
 
 # ---------- idle trash talk ----------
 
-IDLE_TAUNT_SECONDS = 60 * 60  # an hour of silence before the bot starts talking shit
+IDLE_TAUNT_SECONDS = 6 * 60 * 60  # 6 hours of silence before the bot starts talking shit (and between taunts)
 
 IDLE_TAUNTS = [
     "🦗 Crickets. **{remaining}** {unit}(s) still open and y'all are just sitting there.",
