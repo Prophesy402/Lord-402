@@ -41,7 +41,7 @@ from pathlib import Path
 
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import commands
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -711,106 +711,6 @@ async def run_race_shuffle(
     )
 
 
-# ---------- idle trash talk ----------
-
-IDLE_TAUNT_SECONDS = 6 * 60 * 60  # 6 hours of silence before the bot starts talking shit (and between taunts)
-
-IDLE_TAUNTS = [
-    "🦗 Crickets. **{remaining}** {unit}(s) still open and y'all are just sitting there.",
-    "It's been an hour. Did everyone get lost or did you all just go broke?",
-    "**{remaining}** {unit}(s) left. I've seen faster action at a funeral.",
-    "This race has less movement than a parked car in a junkyard. Somebody call a spot.",
-    "Y'all scared of a little duck? **{remaining}** {unit}(s) open.",
-    "An hour with no calls. My hopes and dreams are dying right alongside this thread.",
-    "Not one of you can type X and a number? That's literally two characters.",
-    "I'm a bot with no legs and even I'd move faster than this chat.",
-    "Hello?? **{remaining}** {unit}(s) open. I'm not getting paid to sit here, and neither are you.",
-    "The ducks are getting restless and the humans are getting lazy. Call a spot.",
-    "Is this thing on? Type `X1`. I'm begging.",
-    "If this race fills before sunrise I'll eat my own code.",
-    "You miss 100% of the spots you don't call. Wayne Gretzky said that. Probably.",
-    "Dead thread energy. Somebody poke it with an X.",
-    "Y'all out here with the confidence of a wet paper bag. Call. A. Spot.",
-    "**{remaining}** {unit}(s) open and not a single call in an hour. Embarrassing for everybody involved.",
-    "I could've run three races in the time you've spent staring at this screen.",
-    "Somebody check on the group chat, I think everyone fell asleep face-first in their whiskey.",
-    "Spots don't claim themselves, geniuses. **{remaining}** left.",
-    "An hour of silence. Even the duck is judging you.",
-]
-
-_last_taunt_index: int | None = None
-
-
-def _parse_iso(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
-
-
-def _pick_taunt(remaining: int, unit: str) -> str:
-    global _last_taunt_index
-    choices = [i for i in range(len(IDLE_TAUNTS)) if i != _last_taunt_index]
-    idx = random.choice(choices)
-    _last_taunt_index = idx
-    return IDLE_TAUNTS[idx].format(remaining=remaining, unit=unit)
-
-
-@tasks.loop(minutes=5)
-async def idle_taunt_loop():
-    now = datetime.now(timezone.utc)
-    for key, snapshot in list(_load_all().items()):
-        try:
-            if snapshot.get("status") != "open" or snapshot.get("sat_active"):
-                continue
-
-            # Most recent sign of life: last spot call, else when calls opened,
-            # else when the race was created. A taunt also resets the clock.
-            stamps = []
-            if snapshot.get("entries"):
-                stamps.append(_parse_iso(snapshot["entries"][-1].get("at")))
-            stamps.append(_parse_iso(snapshot.get("spot_calls_open_at")))
-            stamps.append(_parse_iso(snapshot.get("created_at")))
-            stamps.append(_parse_iso(snapshot.get("last_taunt_at")))
-            stamps = [s for s in stamps if s]
-            if not stamps:
-                continue
-            if (now - max(stamps)).total_seconds() < IDLE_TAUNT_SECONDS:
-                continue
-
-            channel = bot.get_channel(int(key))
-            if channel is None:
-                try:
-                    channel = await bot.fetch_channel(int(key))
-                except (discord.NotFound, discord.Forbidden):
-                    continue
-            if isinstance(channel, discord.Thread) and (channel.archived or channel.locked):
-                continue
-
-            race = get_race(int(key))
-            if not race or race["status"] != "open":
-                continue
-            remaining = remaining_spots(race)
-            if remaining <= 0:
-                continue
-
-            await channel.send(_pick_taunt(remaining, unit_label(race)))
-            race["last_taunt_at"] = now.isoformat()
-            save_race(int(key), race)
-        except Exception:
-            log.exception("Idle taunt failed for %s", key)
-
-
-@idle_taunt_loop.before_loop
-async def _before_idle_taunt_loop():
-    await bot.wait_until_ready()
-
-
 # ---------- bot lifecycle ----------
 
 @bot.event
@@ -818,8 +718,6 @@ async def setup_hook():
     # Re-attach the persistent Edit-notes button so it keeps working on
     # notes messages posted before a restart.
     bot.add_view(NotesEditView())
-    if not idle_taunt_loop.is_running():
-        idle_taunt_loop.start()
 
 
 @bot.event
