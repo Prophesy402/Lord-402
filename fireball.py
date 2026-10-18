@@ -866,8 +866,9 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             if hook is None:
                 avatar = PERSONA_AVATAR.read_bytes() if PERSONA_AVATAR.exists() else None
                 hook = await parent.create_webhook(name=PERSONA_NAME, avatar=avatar)
-        except (discord.Forbidden, discord.HTTPException, OSError):
-            log.warning("Can't create the %s webhook in channel %s; posting as the bot instead", PERSONA_NAME, pid)
+        except Exception as exc:
+            log.warning("Can't create the %s webhook in channel %s (%r); posting as the bot instead", PERSONA_NAME, pid, exc)
+            self.__dict__.setdefault("_hook_errors", {})[pid] = repr(exc)[:150]
             hook = None
         cache[pid] = hook or False
         return hook
@@ -877,6 +878,18 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         if "view" not in kw:
             try:
                 hook = await self._hook_for(ch)
+                if hook is None:
+                    parent = ch.parent if isinstance(ch, discord.Thread) else ch
+                    pid = getattr(parent, "id", None)
+                    errs = self.__dict__.get("_hook_errors", {})
+                    warned = self.__dict__.setdefault("_hook_warned", set())
+                    if pid in errs and pid not in warned:
+                        warned.add(pid)
+                        try:
+                            await ch.send(f"⚠️ I can't post as **{PERSONA_NAME}** here yet. Give **Lord 402** the "
+                                          f"**Manage Webhooks** permission in this channel (error: `{errs[pid]}`).")
+                        except discord.HTTPException:
+                            pass
                 if hook is not None:
                     extra = {"thread": ch} if isinstance(ch, discord.Thread) else {}
                     return await hook.send(content, wait=True, **extra, **kw)
