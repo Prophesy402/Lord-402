@@ -720,10 +720,17 @@ async def setup_hook():
     bot.add_view(NotesEditView())
     # Fireball (Illinois Pick 3) side game lives in its own file, fireball.py.
     # If it ever fails to load, duck races keep working exactly as before.
-    try:
-        await bot.load_extension("fireball")
-    except Exception:
-        log.exception("Fireball module failed to load; duck races are unaffected")
+    # With a FIREBALL_TOKEN set, Fireball runs as its own bot (Pyro Steve) and Lord 402
+    # has nothing to do with it. Without one, Lord 402 runs Fireball itself.
+    steve_token = os.getenv("FIREBALL_TOKEN")
+    if steve_token:
+        import steve
+        bot.steve_task = asyncio.create_task(steve.run(steve_token))
+    else:
+        try:
+            await bot.load_extension("fireball")
+        except Exception:
+            log.exception("Fireball module failed to load; duck races are unaffected")
 
 
 @bot.event

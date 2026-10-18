@@ -76,6 +76,7 @@ CONFIG_LIMITS = {
 
 ACTIVE_STATUSES = ("open", "satellite", "animating")
 
+USE_WEBHOOK = True            # steve.py turns this off when Pyro Steve is his own bot
 PERSONA_NAME = "Pyro Steve"
 PERSONA_AVATAR = Path(__file__).with_name("pyro_steve.png")
 STEVE_LINES = [
@@ -494,17 +495,16 @@ def lock_board(data: dict, board: dict) -> str:
     return note
 
 
+def multi_spots(board: dict, user_id: str) -> bool:
+    return sum(1 for x in board["sat"]["spots"] if x and x["user_id"] == str(user_id)) > 1
+
+
 def spot_labels(spots: list[dict]) -> list[str]:
-    """Display names for ducks; duplicates get (1), (2)... so you can tell them apart."""
+    """Display names for ducks; a player with several spots gets (#spot number) on each so you can tell them apart."""
     names = [s["name"] for s in spots]
     labels = []
-    seen: dict[str, int] = {}
-    for nm in names:
-        if names.count(nm) > 1:
-            seen[nm] = seen.get(nm, 0) + 1
-            labels.append(f"{nm} ({seen[nm]})")
-        else:
-            labels.append(nm)
+    for n, nm in enumerate(names, start=1):
+        labels.append(f"{nm} (#{n})" if names.count(nm) > 1 else nm)
     return labels
 
 
@@ -875,7 +875,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
 
     async def _send(self, ch, content: str | None = None, **kw):
         """Post as Pyro Steve when possible (anything without buttons), otherwise as the bot."""
-        if "view" not in kw:
+        if "view" not in kw and USE_WEBHOOK:
             try:
                 hook = await self._hook_for(ch)
                 if hook is None:
@@ -1223,8 +1223,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             for d, idx in sorted(out["assignment"].items()):
                 s = snap["sat"]["spots"][idx]
                 lines.append(
-                    f"🎉 Congrats <@{s['user_id']}>! Digit **{d}** on the Fireball board has been called "
-                    f"for you ({out.get('how', {}).get(d, 'assigned')}).")
+                    f"🎉 Congrats <@{s['user_id']}>! {'Spot **#' + str(idx + 1) + '** won' if multi_spots(snap, s['user_id']) else 'You won'} "
+                    f"digit **{d}** on the Fireball board ({out.get('how', {}).get(d, 'assigned')}).")
             sat_ch = await self._sat_channel(snap)
             main_ch = await self._channel(snap)
             await self._sat_say(
@@ -1234,7 +1234,9 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             )
             if sat_ch is not None and main_ch is not None and sat_ch.id != main_ch.id:
                 names = ", ".join(
-                    f"**{esc(snap['sat']['spots'][idx]['name'])}** (digit {d})"
+                    f"**{esc(snap['sat']['spots'][idx]['name'])}**"
+                    + (f" spot #{idx + 1}" if multi_spots(snap, snap['sat']['spots'][idx]['user_id']) else "")
+                    + f" (digit {d})"
                     for d, idx in sorted(out["assignment"].items()))
                 await self._say(
                     snap,
@@ -1250,7 +1252,10 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
 
         def who(idx: int) -> str:
             sp = spots[idx] if spots and spots[idx] else None
-            return f"<@{sp['user_id']}>" if sp else esc(labels[idx])
+            if not sp:
+                return esc(labels[idx])
+            multi = sum(1 for x in spots if x and x["user_id"] == sp["user_id"]) > 1
+            return f"<@{sp['user_id']}>" + (f" (spot #{idx + 1})" if multi else "")
 
         none = discord.AllowedMentions.none()
         await self._send(ch, f"🌀 **Spinning the ducks!** {steve()}")
