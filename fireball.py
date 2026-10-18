@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import html as htmllib
+import io
 import json
 import logging
 import math
@@ -61,7 +62,8 @@ SAT_THRESHOLD = 7             # digits claimed before the satellite opens
 SAT_SPOTS = 10
 MIN_ROUNDS, MAX_ROUNDS = 3, 12
 SHUFFLE_DELAY = 2.5           # seconds between shuffle rounds
-FIRE_DELAY = 2.2              # seconds between finale edits
+FIRE_DELAY = 2.2              # seconds between finale edits (text fallback only)
+FINALE_WAIT_SCALE = 1.0       # 1.0 = wait for the race GIF to finish playing before revealing winners
 
 DEFAULT_CONFIG = {
     "lock_minutes": 10,     # board locks this many minutes before the draw
@@ -281,7 +283,7 @@ def claim_spot(data: dict, board: dict, user_id: str, name: str, spot: int) -> d
         board["sat"]["outcome"] = compute_outcome(board)
     return {
         "ok": True,
-        "msg": f"You took satellite spot **{spot + 1}** for **{cost}** ticket(s). You're in for **{owed(board, user_id)}** on this game.",
+        "msg": f"You're in the satellite ({sum(1 for x in spots if x)}/{SAT_SPOTS}) for **{cost}** ticket(s). You're in for **{owed(board, user_id)}** on this game.",
         "filled": filled,
     }
 
@@ -502,9 +504,15 @@ def board_embed(board: dict, cfg: dict) -> discord.Embed:
 
 def sat_embed(board: dict, cfg: dict) -> discord.Embed:
     spots = board["sat"]["spots"]
-    labels = [f"`{i + 1:>2}`  " + (f"**{esc(s['name'])}**" if s else "— open") for i, s in enumerate(spots)]
     taken = sum(1 for s in spots if s)
     reserved = ", ".join(str(d) for d in board["sat"]["reserved"]) or "none"
+    counts: dict[str, int] = {}
+    names: dict[str, str] = {}
+    for sp in spots:
+        if sp:
+            counts[sp["user_id"]] = counts.get(sp["user_id"], 0) + 1
+            names[sp["user_id"]] = sp["name"]
+    entered = ", ".join(esc(names[u]) + (f" x{n}" if n > 1 else "") for u, n in counts.items()) or "nobody yet"
     prefs = board["sat"].get("prefs") or {}
     pref_text = ""
     if prefs:
@@ -513,11 +521,11 @@ def sat_embed(board: dict, cfg: dict) -> discord.Embed:
     emb = discord.Embed(
         title="🦆🔥 Fireball Satellite",
         description=(
-            f"**{taken}/{SAT_SPOTS}** spots filled · {board['sat_cost']} ticket(s) each.\n"
-            f"When it fills, the ducks are lit on fire and the **last 3 still burning** each win one of "
-            f"the open digits: **{reserved}**.\n"
+            f"**{taken}/{SAT_SPOTS}** spots filled · **{board['sat_cost']}** ticket(s) each.\n"
+            f"Tap **X1** to take a spot. When it fills, the ducks are lit on fire and the **last 3 still burning** "
+            f"each win one of the open digits: **{reserved}**.\n"
             f"Tap **⭐ Preferences** to rank those digits. Winners get their best available pick.\n\n"
-            + "\n".join(labels) + pref_text
+            f"**Entered:** {entered}" + pref_text
         ),
         color=0xF1C40F if board["status"] == "satellite" else 0x7F8C8D,
     )
@@ -544,7 +552,7 @@ class BoardButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fb:(?P<b
         await cog.on_board_click(interaction, self.board_id, self.action)
 
 
-class SatButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fs:(?P<board>[0-9a-f]+):(?P<action>s\d|yolo|pref)"):
+class SatButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fs:(?P<board>[0-9a-f]+):(?P<action>s\d|yolo|pref|x1)"):
     def __init__(self, board_id: str, action: str, label: str = "?", style=discord.ButtonStyle.secondary,
                  disabled: bool = False, row: int | None = None):
         super().__init__(discord.ui.Button(
@@ -596,16 +604,10 @@ def board_view(board: dict) -> discord.ui.View:
 
 def sat_view(board: dict) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
-    live = board["status"] == "satellite"
-    for i, s in enumerate(board["sat"]["spots"]):
-        if s:
-            btn = SatButton(board["id"], f"s{i}", f"{i + 1} · {short(s['name'], 7)}",
-                            discord.ButtonStyle.secondary, True, row=i // 5)
-        else:
-            btn = SatButton(board["id"], f"s{i}", str(i + 1), discord.ButtonStyle.primary, not live, row=i // 5)
-        view.add_item(btn)
-    view.add_item(SatButton(board["id"], "yolo", "🎲 YOLO", discord.ButtonStyle.success, not live, row=2))
-    view.add_item(SatButton(board["id"], "pref", "⭐ Preferences", discord.ButtonStyle.secondary, not live, row=2))
+    live = board["status"] == "satellite" and not all(board["sat"]["spots"])
+    view.add_item(SatButton(board["id"], "x1", "X1", discord.ButtonStyle.primary, not live, row=0))
+    view.add_item(SatButton(board["id"], "pref", "⭐ Preferences", discord.ButtonStyle.secondary,
+                            board["status"] != "satellite", row=0))
     return view
 
 
@@ -829,12 +831,12 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 await interaction.response.send_message(
                     pref_text(current, reserved), view=pref_view(self, board_id, reserved, current), ephemeral=True)
                 return
-            if action == "yolo":
+            if action in ("x1", "yolo"):
                 free = [i for i, s in enumerate(board["sat"]["spots"]) if not s]
                 if not free:
                     await interaction.response.send_message("The satellite is full.", ephemeral=True)
                     return
-                spot = random.choice(free)
+                spot = free[0] if action == "x1" else random.choice(free)
             else:
                 spot = int(action[1:])
             result = claim_spot(self.store.data, board, str(user.id), user.display_name, spot)
@@ -951,6 +953,21 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             await asyncio.sleep(SHUFFLE_DELAY)
 
     async def _play_fire(self, ch, labels: list[str], out: dict, board: dict):
+        """The ducks-on-fire finale: an animated GIF of them racing. Falls back to a text version."""
+        try:
+            from fireanim import render_finale_gif
+            gif, seconds = await asyncio.to_thread(
+                render_finale_gif, labels, out["elim_order"], out["winners"], board["id"])
+            if len(gif) > 7_500_000:
+                raise RuntimeError(f"finale GIF too big ({len(gif)} bytes)")
+            await ch.send("🔥🔥 **THE DUCKS ARE ON FIRE** 🔥🔥",
+                          file=discord.File(io.BytesIO(gif), filename="duck-fire.gif"))
+            await asyncio.sleep(seconds * FINALE_WAIT_SCALE)
+        except Exception:
+            log.warning("Fireball race GIF failed; using the text finale instead", exc_info=True)
+            await self._play_fire_text(ch, labels, out, board)
+
+    async def _play_fire_text(self, ch, labels: list[str], out: dict, board: dict):
         state = ["burn"] * len(labels)   # burn | smoke | dead
 
         def render(note: str) -> str:
