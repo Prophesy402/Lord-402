@@ -67,7 +67,7 @@ Played on the **Illinois Pick 3 Fireball** digit (0–9).
    • `draw` — Midday (12:40 CT) / Evening (9:22 CT), blank = next
    • `bb` — on for **90% buyback** games
 2. The bot opens a thread **[OPEN] - CODE** with the digit board.
-3. Claims lock **10 min before the draw** (or tap **Close**).
+3. Claims lock **10 min before the draw** (or Host Controls → Close).
 
 **PLAYERS — claiming digits**
 • Tap a digit **0–9** to claim it.
@@ -86,7 +86,6 @@ Played on the **Illinois Pick 3 Fireball** digit (0–9).
 **SIP**
 • Sent the host your tickets? Tap **💸 Sip** on the board (or type `sip`).
   The host gets a DM to ✅ confirm or ❌ deny; you hear back privately.
-• Host: **🔔 Remind sips** pings everyone who still owes.
 
 **THE RESULT**
 • Minutes after the draw the bot posts the result from
@@ -94,8 +93,9 @@ Played on the **Illinois Pick 3 Fireball** digit (0–9).
 • Winner takes the prize. In **90% BB** games the post shows the buyback math.
 
 **HOST / ADMIN TOOLS**
+• **Host Controls** (host + mods): release a spot someone didn't mean to
+  call, force/remind sips, expected sips, close the board
+• **Admin Controls** (mods): all of that plus cancel the board
 • `/fireball result` — re-check the site, or enter the digit by hand
 • `/fireball notes` — update the host notes
-• `/fireball-cancel` — **mods only**: cancel the board; **every claim is void**
-• `/fireball config lock_minutes:` — admins: change the lock time
 ```

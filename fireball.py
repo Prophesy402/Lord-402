@@ -570,6 +570,70 @@ def sip_lines(board: dict) -> str:
     return text if len(text) <= 1024 else text[:1020] + "…"
 
 
+def releasable(board: dict) -> list[tuple[str, str]]:
+    """(value, label) for every spot the host can release right now: main-board digits while the
+    board is open, satellite spots while the satellite is still filling. Digits won in the
+    satellite stay put."""
+    out = []
+    if board["status"] == "open":
+        for d in range(10):
+            c = board["digits"][str(d)]
+            if c and c.get("via") == "claim":
+                out.append((f"d{d}", f"Digit {d} · {c['name']}"))
+    if board["status"] == "satellite" and not all(board["sat"]["spots"]):
+        for i, s in enumerate(board["sat"]["spots"]):
+            if s:
+                out.append((f"s{i}", f"Satellite spot #{i + 1} · {s['name']}"))
+    return out
+
+
+def release(board: dict, value: str) -> dict | None:
+    """
+    Undo one claim ("d3" = digit 3, "s4" = satellite spot #5): free the spot and drop what it cost.
+    Returns {"user_id", "name", "what"} or None if it can't be released (anymore).
+    """
+    if value not in {v for v, _ in releasable(board)}:
+        return None
+    kind, n = value[0], int(value[1:])
+    if kind == "d":
+        c = board["digits"][str(n)]
+        uid = c["user_id"]
+        for e in board["ledger"]:
+            slots = [x for x in str(e["slot"]).split(",") if x]
+            if e["kind"] == "digit" and e["user_id"] == uid and str(n) in slots:
+                slots.remove(str(n))
+                if slots:     # an Odds/Evens claim: keep the rest of it
+                    e["amount"] -= board["digit_cost"]
+                    e["slot"] = ",".join(slots)
+                else:
+                    board["ledger"].remove(e)
+                break
+        board["digits"][str(n)] = None
+        # Dropped back under 7 during the last-call countdown: the satellite isn't due anymore.
+        if board.get("sat_at") and len(claimed_digits(board)) < SAT_THRESHOLD:
+            board["sat_at"] = None
+        return {"user_id": uid, "name": c["name"], "what": f"digit **{n}**"}
+    s = board["sat"]["spots"][n]
+    uid = s["user_id"]
+    for e in board["ledger"]:
+        if e["kind"] == "sat" and e["user_id"] == uid and str(e["slot"]) == str(n):
+            board["ledger"].remove(e)
+            break
+    board["sat"]["spots"][n] = None
+    if not any(x and x["user_id"] == uid for x in board["sat"]["spots"]):
+        board["sat"].get("prefs", {}).pop(uid, None)
+    return {"user_id": uid, "name": s["name"], "what": f"satellite spot **#{n + 1}**"}
+
+
+def force_sip(board: dict, user_id: str) -> int:
+    """Host/mod marks a player as paid in full without waiting for them to sip. Returns the amount."""
+    amount = owed(board, user_id)
+    names = ticket_names(board)
+    board.setdefault("sips", {})[str(user_id)] = {
+        "name": names.get(str(user_id), "Player"), "amount": amount, "status": "confirmed", "channel_id": None}
+    return amount
+
+
 def lock_board(data: dict, board: dict) -> str:
     """Close claiming (Close button or draw time). Returns a short note for the channel."""
     note = ""
@@ -748,7 +812,7 @@ def sat_embed(board: dict, cfg: dict) -> discord.Embed:
     return emb
 
 
-class BoardButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fb:(?P<board>[0-9a-f]+):(?P<action>d\d|yolo|odds|evens|close|sip|remind)"):
+class BoardButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fb:(?P<board>[0-9a-f]+):(?P<action>d\d|yolo|odds|evens|close|sip|remind|host|admin)"):
     def __init__(self, board_id: str, action: str, label: str = "?", style=discord.ButtonStyle.secondary,
                  disabled: bool = False, row: int | None = None):
         super().__init__(discord.ui.Button(
@@ -843,11 +907,55 @@ def board_view(board: dict) -> discord.ui.View:
     view.add_item(BoardButton(board["id"], "yolo", "🎲 YOLO", discord.ButtonStyle.success, not live, row=2))
     view.add_item(BoardButton(board["id"], "odds", "Odds", discord.ButtonStyle.secondary, not live, row=2))
     view.add_item(BoardButton(board["id"], "evens", "Evens", discord.ButtonStyle.secondary, not live, row=2))
-    closable = board["status"] in ("open", "satellite")
-    view.add_item(BoardButton(board["id"], "close", "Close", discord.ButtonStyle.danger, not closable, row=2))
     no_sips = board["status"] == "cancelled" or not board["ledger"]
     view.add_item(BoardButton(board["id"], "sip", "💸 Sip", discord.ButtonStyle.success, no_sips, row=3))
-    view.add_item(BoardButton(board["id"], "remind", "🔔 Remind sips", discord.ButtonStyle.secondary, no_sips, row=3))
+    done = board["status"] == "cancelled"
+    view.add_item(BoardButton(board["id"], "host", "Host Controls", discord.ButtonStyle.primary, done, row=3))
+    view.add_item(BoardButton(board["id"], "admin", "Admin Controls", discord.ButtonStyle.primary, done, row=3))
+    return view
+
+
+class ControlPanel(discord.ui.View):
+    """The private panel behind Host Controls / Admin Controls. Every button re-checks who's pressing."""
+
+    def __init__(self, cog, board_id: str, admin: bool):
+        super().__init__(timeout=600)
+        self.cog, self.board_id = cog, board_id
+        buttons = [
+            ("🔓 Release Spot", discord.ButtonStyle.primary, self.cog.panel_release),
+            ("✅ Force Sip", discord.ButtonStyle.primary, self.cog.panel_force_sip),
+            ("🔔 Remind Sips", discord.ButtonStyle.secondary, self.cog._remind_sips),
+            ("📋 Expected Sips", discord.ButtonStyle.secondary, self.cog.panel_expected),
+            ("🔒 Close Board", discord.ButtonStyle.danger, self.cog.panel_close),
+        ]
+        if admin:
+            buttons.append(("🛑 Cancel Board", discord.ButtonStyle.danger, self.cog.panel_cancel))
+        for label, style, handler in buttons:
+            btn = discord.ui.Button(label=label, style=style)
+            btn.callback = self._wrap(handler)
+            self.add_item(btn)
+
+    def _wrap(self, handler):
+        async def cb(interaction: discord.Interaction):
+            await handler(interaction, self.board_id)
+        return cb
+
+
+class PickSelect(discord.ui.Select):
+    """A one-shot private dropdown (which spot to release / whose sip to force)."""
+
+    def __init__(self, options: list[tuple[str, str]], placeholder: str, on_pick):
+        super().__init__(placeholder=placeholder,
+                         options=[discord.SelectOption(label=lab[:100], value=val) for val, lab in options[:25]])
+        self.on_pick = on_pick
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.on_pick(interaction, self.values[0])
+
+
+def pick_view(options: list[tuple[str, str]], placeholder: str, on_pick) -> discord.ui.View:
+    view = discord.ui.View(timeout=300)
+    view.add_item(PickSelect(options, placeholder, on_pick))
     return view
 
 
@@ -895,6 +1003,11 @@ def pref_text(current: list[int], reserved: list[int]) -> str:
 def is_admin(interaction: discord.Interaction) -> bool:
     m = interaction.user
     return isinstance(m, discord.Member) and m.guild_permissions.administrator
+
+
+def can_host(interaction: discord.Interaction, board: dict) -> bool:
+    """The game's host, or a moderator."""
+    return str(interaction.user.id) == board["host_id"] or is_mod(interaction)
 
 
 def is_mod(interaction: discord.Interaction) -> bool:
@@ -1118,6 +1231,9 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         if action == "remind":
             await self._remind_sips(interaction, board_id)
             return
+        if action in ("host", "admin"):
+            await self._open_panel(interaction, board_id, admin=action == "admin")
+            return
         user = interaction.user
         opened_sat = False
         reply = ""
@@ -1129,8 +1245,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 return
 
             if action == "close":
-                if str(user.id) != board["host_id"] and not is_admin(interaction):
-                    await interaction.response.send_message("Only the host or an admin can close the board.", ephemeral=True)
+                if not can_host(interaction, board):
+                    await interaction.response.send_message("Only the host or a mod can close the board.", ephemeral=True)
                     return
                 if board["status"] not in ("open", "satellite"):
                     await interaction.response.send_message("The board can't be closed right now.", ephemeral=True)
@@ -1329,8 +1445,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             if not board:
                 await interaction.response.send_message("This board is no longer active.", ephemeral=True)
                 return
-            if str(interaction.user.id) != board["host_id"] and not is_admin(interaction):
-                await interaction.response.send_message("Only the host or an admin can send sip reminders.", ephemeral=True)
+            if not can_host(interaction, board):
+                await interaction.response.send_message("Only the host or a mod can send sip reminders.", ephemeral=True)
                 return
             now = datetime.now(timezone.utc)
             last = board.get("last_remind_at")
@@ -1352,6 +1468,129 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         await interaction.response.send_message(f"🔔 Reminder sent to {len(due)} player(s).{pending_note}", ephemeral=True)
         await self._say(snap, f"🔔 **Sip reminder** for Fireball {esc(snap.get('code') or '')}: {who}\n"
                               f"Send the host your tickets, then tap **💸 Sip** on the board (or type `sip`).")
+
+    async def _panel_board(self, interaction: discord.Interaction, board_id: str) -> dict | None:
+        """Snapshot of the board if the presser may use host controls on it; otherwise answers them and returns None."""
+        async with self.store.lock:
+            board = self.store.data["boards"].get(board_id)
+            snap = json.loads(json.dumps(board)) if board else None
+        if not snap:
+            await interaction.response.send_message("This board is no longer active.", ephemeral=True)
+            return None
+        if not can_host(interaction, snap):
+            await interaction.response.send_message("Only the host or a mod can use these controls.", ephemeral=True)
+            return None
+        return snap
+
+    async def _open_panel(self, interaction: discord.Interaction, board_id: str, admin: bool):
+        if admin:
+            if not is_mod(interaction):
+                await interaction.response.send_message("Admin Controls are for mods only.", ephemeral=True)
+                return
+            snap = await self._panel_board(interaction, board_id)
+        else:
+            snap = await self._panel_board(interaction, board_id)
+        if not snap:
+            return
+        title = "🛡️ **Admin Controls**" if admin else "🛠️ **Host Controls**"
+        await interaction.response.send_message(
+            f"{title} for Fireball {esc(snap.get('code') or '')}", view=ControlPanel(self, board_id, admin), ephemeral=True)
+
+    async def panel_release(self, interaction: discord.Interaction, board_id: str):
+        snap = await self._panel_board(interaction, board_id)
+        if not snap:
+            return
+        options = releasable(snap)
+        if not options:
+            why = ("The satellite is full, so its spots are locked in." if snap["status"] == "satellite"
+                   else "Nothing can be released right now (digits only while the board is open, "
+                        "satellite spots only while it's filling).")
+            await interaction.response.send_message(why, ephemeral=True)
+            return
+
+        async def picked(inter: discord.Interaction, value: str):
+            async with self.store.lock:
+                board = self.store.data["boards"].get(board_id)
+                if not board or not can_host(inter, board):
+                    await inter.response.send_message("You can't do that.", ephemeral=True)
+                    return
+                gone = release(board, value)
+                if gone is None:
+                    await inter.response.edit_message(content="That spot can't be released anymore.", view=None)
+                    return
+                self.store.save()
+                s = json.loads(json.dumps(board))
+            await inter.response.edit_message(
+                content=f"🔓 Released {gone['what']} from **{esc(gone['name'])}**. Their tickets for it are void.", view=None)
+            note = (f"🔓 {esc(inter.user.display_name)} released {gone['what']} from <@{gone['user_id']}>. "
+                    f"It's open again.")
+            if value.startswith("s"):
+                await self._sat_say(s, note, allowed_mentions=discord.AllowedMentions.none())
+            else:
+                await self._say(s, note, allowed_mentions=discord.AllowedMentions.none())
+            await self._refresh(board_id)
+
+        await interaction.response.send_message(
+            "Which spot do you want to release?", view=pick_view(options, "Pick a spot", picked), ephemeral=True)
+
+    async def panel_force_sip(self, interaction: discord.Interaction, board_id: str):
+        snap = await self._panel_board(interaction, board_id)
+        if not snap:
+            return
+        names = ticket_names(snap)
+        sips = snap.get("sips", {})
+        options = []
+        for uid in dict.fromkeys(e["user_id"] for e in snap["ledger"]):
+            s, amount = sips.get(uid), owed(snap, uid)
+            if s and s["status"] == "confirmed" and s["amount"] >= amount:
+                continue
+            state = {"pending": "waiting on you", "denied": "denied"}.get((s or {}).get("status"), "not sipped")
+            options.append((uid, f"{names.get(uid, 'Player')} · {fmt_num(amount)} · {state}"))
+        if not options:
+            await interaction.response.send_message("Everyone's sip is already confirmed.", ephemeral=True)
+            return
+
+        async def picked(inter: discord.Interaction, uid: str):
+            async with self.store.lock:
+                board = self.store.data["boards"].get(board_id)
+                if not board or not can_host(inter, board):
+                    await inter.response.send_message("You can't do that.", ephemeral=True)
+                    return
+                amount = force_sip(board, uid)
+                self.store.save()
+                code = board.get("code") or ""
+            await inter.response.edit_message(
+                content=f"✅ Marked <@{uid}> as sipped (**{fmt_num(amount)}** ticket(s)).", view=None)
+            try:
+                player = self.bot.get_user(int(uid)) or await self.bot.fetch_user(int(uid))
+                await player.send(f"✅ The host marked your sip as confirmed (**{fmt_num(amount)}** ticket(s)) "
+                                  f"on Fireball {esc(code)}.")
+            except (discord.HTTPException, ValueError):
+                pass
+            await self._refresh(board_id)
+
+        await interaction.response.send_message(
+            "Whose sip do you want to confirm?", view=pick_view(options, "Pick a player", picked), ephemeral=True)
+
+    async def panel_expected(self, interaction: discord.Interaction, board_id: str):
+        snap = await self._panel_board(interaction, board_id)
+        if not snap:
+            return
+        if not snap["ledger"]:
+            await interaction.response.send_message("Nobody has claimed anything yet.", ephemeral=True)
+            return
+        confirmed = sum(min(s["amount"], owed(snap, u)) for u, s in snap.get("sips", {}).items()
+                        if s["status"] == "confirmed")
+        total = ticket_total(snap)
+        await interaction.response.send_message(
+            f"📋 **Expected sips:** **{fmt_num(total)}** ticket(s) · confirmed **{fmt_num(confirmed)}** · "
+            f"still out **{fmt_num(total - confirmed)}**\n{sip_lines(snap)}", ephemeral=True)
+
+    async def panel_close(self, interaction: discord.Interaction, board_id: str):
+        await self.on_board_click(interaction, board_id, "close")
+
+    async def panel_cancel(self, interaction: discord.Interaction, board_id: str):
+        await self.cancel(interaction)
 
     async def on_sip_decision(self, interaction: discord.Interaction, board_id: str, user_id: str, approve: bool):
         async with self.store.lock:
