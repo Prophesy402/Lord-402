@@ -60,6 +60,7 @@ RESULT_GIVE_UP_HOURS = 6      # then ask the host to enter it by hand
 
 SAT_THRESHOLD = 7             # digits claimed before the satellite opens
 SAT_SPOTS = 10
+SAT_DELAY = 5                 # seconds after the 7th digit before the satellite opens (last chance for others)
 MIN_ROUNDS, MAX_ROUNDS = 3, 12
 SHUFFLE_DELAY = 2.5           # seconds between shuffle rounds
 FIRE_DELAY = 2.2              # seconds between finale edits (text fallback only)
@@ -162,18 +163,84 @@ def owed(board: dict, user_id: str) -> int:
     return sum(e["amount"] for e in board["ledger"] if e["user_id"] == str(user_id))
 
 
+def fmt_num(x: float) -> str:
+    return f"{x:,.2f}".rstrip("0").rstrip(".") if x != int(x) else f"{int(x):,}"
+
+
+def ticket_terms(board: dict) -> list[str]:
+    """One term per digit sold, in order, with the satellite spots grouped in brackets at the end."""
+    terms: list[str] = []
+    sats: list[str] = []
+    for e in board["ledger"]:
+        if e["kind"] == "sat":
+            sats.append(fmt_num(e["amount"]))
+        else:
+            slots = [x for x in str(e["slot"]).split(",") if x] or [""]
+            for _ in slots:
+                terms.append(fmt_num(e["amount"] / len(slots)))
+    if sats:
+        terms.append("(" + " + ".join(sats) + ")")
+    return terms
+
+
+def ticket_total(board: dict) -> int:
+    return sum(e["amount"] for e in board["ledger"])
+
+
+def ticket_names(board: dict) -> dict[str, str]:
+    names: dict[str, str] = {}
+    for c in board["digits"].values():
+        if c:
+            names[c["user_id"]] = c["name"]
+    for sp in board["sat"]["spots"]:
+        if sp:
+            names[sp["user_id"]] = sp["name"]
+    return names
+
+
+def result_text(board: dict, holder: dict | None, fireball: int) -> str:
+    """The post under the result: congrats, the buyback math (90% BB games) and every player's tickets."""
+    total = ticket_total(board)
+    dc = board["digit_cost"]
+    lines: list[str] = []
+    if holder:
+        via = " (won it in the satellite 🦆)" if holder.get("via") == "satellite" else ""
+        if board.get("bb"):
+            bb = total * 0.9
+            lines.append(
+                f"Congrats <@{holder['user_id']}>! Total expected tickets were **{fmt_num(total)}**, therefore the buyback is "
+                f"**{fmt_num(bb)}**, or **{fmt_num(max(0, bb - dc))}** if the winner hasn't sipped.\n"
+                f"**Here's the math:**\n```\nTotal Tickets: {' + '.join(ticket_terms(board)) or '0'} = {fmt_num(total)}\n"
+                f"Buy back: {fmt_num(total)} * .9 = {fmt_num(bb)}\n"
+                f"Buyback if winner didn't sip: {fmt_num(bb)} - {fmt_num(dc)} = {fmt_num(max(0, bb - dc))}\n```")
+        else:
+            lines.append(f"🏆 Congrats <@{holder['user_id']}>! Digit **{fireball}**{via} wins the **{esc(str(board['prize']))}** prize!")
+    else:
+        lines.append(f"Nobody held digit **{fireball}**. No winner this draw.")
+    names = ticket_names(board)
+    per: dict[str, int] = {}
+    for e in board["ledger"]:
+        per[e["user_id"]] = per.get(e["user_id"], 0) + e["amount"]
+    roster = ", ".join(f"{esc(names.get(u, 'Player'))} **{fmt_num(a)}**"
+                       for u, a in sorted(per.items(), key=lambda kv: -kv[1]))
+    lines.append(f"🎟️ **Tickets by player:** {roster or 'none'}\n🎟️ **Total tickets from players: {fmt_num(total)}**")
+    text = "\n".join(lines)
+    return text if len(text) <= 1900 else text[:1890] + "…"
+
+
 def digit_cost_for_prize(prize: int) -> int:
     """Each of the 10 digits is worth a tenth of the prize (prize 500 -> 50 tickets a digit)."""
     return max(1, math.ceil(prize / 10))
 
 
-def satellite_cost(digit_cost: int) -> int:
+def satellite_cost(digit_cost: int, open_count: int | None = None) -> int:
     """
     One satellite spot's price: the cost of the digits it is for (the 3 that are
     still open when it starts), split evenly across the 10 spots. Whole tickets
     only, so it rounds up (3 digits at 10 tickets = 30 tickets / 10 spots = 3).
     """
-    return math.ceil((10 - SAT_THRESHOLD) * digit_cost / SAT_SPOTS)
+    k = (10 - SAT_THRESHOLD) if open_count is None else open_count
+    return math.ceil(k * digit_cost / SAT_SPOTS)
 
 
 def new_board(guild_id, channel_id, host_id, host_name, draw: str, draw_date: date, prize: str, lock_minutes: int,
@@ -202,6 +269,7 @@ def new_board(guild_id, channel_id, host_id, host_name, draw: str, draw_date: da
         "sat_cost": satellite_cost(digit_cost) if sat_cost is None else sat_cost,
         "status": "open",                # open > satellite > animating > locked > settled | cancelled
         "digits": {str(d): None for d in range(10)},
+        "sat_at": None,
         "sat": {"spots": [None] * SAT_SPOTS, "reserved": [], "prefs": {}, "outcome": None, "msg_id": None},
         "ledger": [],
         "board_msg_id": None,
@@ -246,7 +314,8 @@ def claim_digits(data: dict, board: dict, user_id: str, name: str, requested: li
     avail = [d for d in requested if not board["digits"][str(d)]]
     if not avail:
         return {"ok": False, "msg": "Those digits are already taken.", "claimed": [], "opened_sat": False}
-    room = SAT_THRESHOLD - len(claimed_digits(board))
+    pending = bool(board.get("sat_at"))      # grace window: others may still claim before the satellite opens
+    room = (10 if pending else SAT_THRESHOLD) - len(claimed_digits(board))
     clamped = False
     if len(avail) > room:
         avail = random.sample(avail, room)
@@ -256,15 +325,33 @@ def claim_digits(data: dict, board: dict, user_id: str, name: str, requested: li
     for d in avail:
         board["digits"][str(d)] = {"user_id": str(user_id), "name": name, "via": "claim"}
     opened = False
-    if len(claimed_digits(board)) >= SAT_THRESHOLD:
-        board["status"] = "satellite"
-        board["sat"]["reserved"] = open_digits(board)
-        opened = True
+    if not pending and len(claimed_digits(board)) >= SAT_THRESHOLD:
+        board["sat_at"] = (datetime.now(timezone.utc) + timedelta(seconds=SAT_DELAY)).isoformat()
+        opened = True      # means: the grace window just started
     shown = ", ".join(str(d) for d in sorted(avail))
     msg = f"You claimed digit **{shown}** for **{cost}** ticket(s). You're in for **{owed(board, user_id)}** on this game."
     if clamped:
         msg += " (Rounded down to what was left before the satellite.)"
     return {"ok": True, "msg": msg, "claimed": sorted(avail), "opened_sat": opened}
+
+
+def open_satellite(board: dict) -> str | None:
+    """
+    End of the grace window. Whatever digits are still open become the satellite prize:
+    normally 3, fewer if somebody grabbed one in the meantime. Returns "satellite",
+    "full" (all ten went, so no satellite) or None (nothing to do).
+    """
+    if board["status"] != "open" or not board.get("sat_at"):
+        return None
+    board["sat_at"] = None
+    left = open_digits(board)
+    if not left:
+        board["status"] = "locked"
+        return "full"
+    board["status"] = "satellite"
+    board["sat"]["reserved"] = left
+    board["sat_cost"] = satellite_cost(board["digit_cost"], len(left))
+    return "satellite"
 
 
 def claim_spot(data: dict, board: dict, user_id: str, name: str, spot: int) -> dict:
@@ -365,6 +452,7 @@ def apply_outcome(board: dict) -> None:
 def lock_board(data: dict, board: dict) -> str:
     """Close claiming (Close button or draw time). Returns a short note for the channel."""
     note = ""
+    board["sat_at"] = None
     if board["status"] == "satellite":
         spots_taken = sum(1 for s in board["sat"]["spots"] if s)
         returned = void_charges(board, ("sat",))
@@ -484,20 +572,25 @@ def board_embed(board: dict, cfg: dict) -> discord.Embed:
     emb = discord.Embed(
         title=f"🔥 Fireball{(' ' + board['code']) if board.get('code') else ''} — {draw_title(board)}",
         description=(f"**Prize:** {esc(str(board['prize']))}  *(winner takes all)* · "
-                     f"each digit is worth **{board['digit_cost']}**\n\n" + "\n".join(lines)),
+                     f"each digit is worth **{board['digit_cost']}**"
+                     f"{' · **90% BB**' if board.get('bb') else ''}\n\n" + "\n".join(lines)),
         color=colors.get(status, 0xE67E22),
     )
+    if status == "open" and board.get("sat_at"):
+        state_text_override = "7 digits are claimed! The satellite opens in a few seconds. Grab a digit now if you want one."
+    else:
+        state_text_override = None
     state_text = {
         "open": f"Claims close {ts(board['lock_at'], 'R')} · draw at {ts(board['draw_at'], 't')}",
-        "satellite": "7 digits are gone. The satellite is open below for the last 3.",
+        "satellite": f"The satellite is open for the last {len(board['sat']['reserved'])} digit(s).",
         "animating": "Satellite is full. The shuffle and the fire are underway...",
         "locked": f"Claims are closed. Draw at {ts(board['draw_at'], 't')}. Result posts automatically.",
         "settled": "Settled. See the result below.",
         "cancelled": "Cancelled. All tickets were returned.",
     }
-    emb.add_field(name="Status", value=state_text.get(status, status), inline=False)
+    emb.add_field(name="Status", value=state_text_override or state_text.get(status, status), inline=False)
     emb.set_footer(
-        text=f"Digit: {board['digit_cost']} ticket(s) · Satellite spot: {board['sat_cost']} (the last 3 digits split 10 ways) · Host: {board['host_name']}"
+        text=f"Digit: {board['digit_cost']} ticket(s) · Satellite spot: {board['sat_cost']} (the open digits split 10 ways) · Host: {board['host_name']}"
     )
     return emb
 
@@ -518,7 +611,7 @@ def sat_embed(board: dict, cfg: dict) -> discord.Embed:
         title="🦆🔥 Fireball Satellite",
         description=(
             f"**{taken}/{SAT_SPOTS}** spots filled · **{board['sat_cost']}** ticket(s) each.\n"
-            f"Tap **X1** to take a spot. When it fills, the ducks are lit on fire and the **last 3 still burning** "
+            f"Tap **X1** to take a spot. When it fills, the ducks are lit on fire and the **last {len(board['sat']['reserved'])} still burning** "
             f"each win one of the open digits: **{reserved}**.\n"
             f"Tap **⭐ Preferences** to rank those digits. Winners get their best available pick.\n\n"
             f"{roster}" + pref_text
@@ -694,6 +787,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             bid = b["id"]
             if b["status"] in ("open", "satellite") and now >= datetime.fromisoformat(b["lock_at"]):
                 await self._auto_lock(bid)
+            elif b["status"] == "open" and b.get("sat_at") and now >= datetime.fromisoformat(b["sat_at"]):
+                await self._open_sat_flow(bid)
             elif b["status"] == "locked" and not b.get("result"):
                 await self._maybe_fetch_result(bid, now)
 
@@ -844,8 +939,10 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             await self._say(snapshot, f"🔒 **Fireball board closed** by {esc(user.display_name)}. {closed_note}".strip())
             await self._tag(snapshot, "CLOSED")
             await self._retire_sat(snapshot)
-        if opened_sat:
-            await self._post_satellite(board_id)
+        if opened_sat:     # the 7th digit just went: short grace window, then the satellite opens
+            await self._say(snapshot, f"⏳ **7 digits are claimed!** The satellite opens in {SAT_DELAY} seconds. "
+                                      "Last chance to grab a digit on the main board.")
+            asyncio.create_task(self._open_sat_flow(board_id, delay=SAT_DELAY))
 
     async def on_sat_click(self, interaction: discord.Interaction, board_id: str, action: str):
         user = interaction.user
@@ -907,6 +1004,26 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             content=pref_text(current, reserved), view=pref_view(self, board_id, reserved, current))
         await self._refresh(board_id)
 
+    async def _open_sat_flow(self, board_id: str, delay: float = 0):
+        if delay:
+            await asyncio.sleep(delay)
+        async with self.store.lock:
+            board = self.store.data["boards"].get(board_id)
+            if not board:
+                return
+            result = open_satellite(board)
+            if result:
+                self.store.save()
+            snap = json.loads(json.dumps(board))
+        if result is None:
+            return
+        await self._refresh(board_id)
+        if result == "full":
+            await self._say(snap, "🔒 **All ten digits were claimed during the countdown, so there's no satellite.** "
+                                  f"The board is full. Draw at {ts(snap['draw_at'], 't')}.")
+            return
+        await self._post_satellite(board_id)
+
     async def _post_satellite(self, board_id: str):
         async with self.store.lock:
             board = self.store.data["boards"].get(board_id)
@@ -930,9 +1047,9 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 main_link = main.mention if main is not None else "the main thread"
                 text = (
                     f"🦆🔥 **SATELLITE for Fireball {esc(snap.get('code') or '')}** is open! {draw_title(snap)}\n"
-                    f"This is the **satellite**, not the main game. 7 digits are claimed; the last 3 "
+                    f"This is the **satellite**, not the main game. The last {len(snap['sat']['reserved'])} "
                     f"(**{', '.join(str(d) for d in snap['sat']['reserved'])}**) are decided here. "
-                    f"10 spots at **{snap['sat_cost']}** ticket(s) each; the last 3 ducks still burning win a digit "
+                    f"10 spots at **{snap['sat_cost']}** ticket(s) each; the last {len(snap['sat']['reserved'])} duck(s) still burning win a digit "
                     f"on the main board.\nMain game: {main_link}")
                 kw = {"file": file} if file is not None else {}
                 ann = await parent.send(text, **kw)
@@ -950,12 +1067,12 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             msg = await thread.send(embed=sat_embed(snap, cfg), view=sat_view(snap))
             if main is not None:
                 try:
-                    await main.send(f"🦆🔥 **7 digits are claimed. The satellite is open for the last 3!** Join it here: {thread.mention}")
+                    await main.send(f"🦆🔥 **The satellite is open for the last {len(snap['sat']['reserved'])} digit(s)!** Join it here: {thread.mention}")
                 except discord.HTTPException:
                     pass
         else:   # couldn't make a thread: fall back to the old in-place satellite
             msg = await self._say(
-                snap, "🦆🔥 **7 digits are claimed. The satellite is open for the last 3!**",
+                snap, f"🦆🔥 **The satellite is open for the last {len(snap['sat']['reserved'])} digit(s)!**",
                 embed=sat_embed(snap, cfg), view=sat_view(snap))
         if msg:
             async with self.store.lock:
@@ -1010,7 +1127,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             main_ch = await self._channel(snap)
             await self._sat_say(
                 snap,
-                "🔥 **The fire has settled.** The last three ducks standing:\n" + "\n".join(lines) +
+                "🔥 **The fire has settled.** The last ducks standing:\n" + "\n".join(lines) +
                 f"\n\nThe board is full. Draw at {ts(snap['draw_at'], 't')}; the result posts automatically.",
             )
             if sat_ch is not None and main_ch is not None and sat_ch.id != main_ch.id:
@@ -1163,16 +1280,12 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             self.store.save()
             snap = json.loads(json.dumps(board))
         pick = "-".join(str(b) for b in balls) if balls else "n/a"
-        emb = discord.Embed(
-            title=f"🔥 Fireball result — {draw_title(snap)}",
-            description=f"**Pick 3:** {pick}\n**Fireball:** 🔥 **{fireball}**",
-            color=0x2ECC71 if holder else 0x95A5A6,
-        )
-        if holder:
-            via = " (won it in the satellite 🦆)" if holder.get("via") == "satellite" else ""
-            text = f"🏆 <@{holder['user_id']}> held digit **{fireball}**{via} and wins the **{snap['prize']}** prize!"
-        else:
-            text = f"Nobody held digit **{fireball}**. No winner this draw."
+        emb = discord.Embed(title="Illinois Pick 3 Results", color=0x2ECC71 if holder else 0x95A5A6)
+        emb.add_field(name="Fireball", value=str(fireball), inline=True)
+        emb.add_field(name="Otherballs", value=", ".join(str(b) for b in balls) if balls else "n/a", inline=True)
+        emb.add_field(name="Link", value=RESULTS_URL, inline=False)
+        emb.set_footer(text=f"{date.fromisoformat(snap['draw_date']).strftime('%A %b %d, %Y').replace(' 0', ' ')} ({snap['draw'].title()})")
+        text = result_text(snap, holder, fireball)
         msg = await self._say(snap, text, embed=emb)
         async with self.store.lock:
             b = self.store.data["boards"].get(board_id)
@@ -1190,12 +1303,13 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         prize="Prize amount. Each of the 10 digits is worth a tenth of it (500 -> 50 tickets a digit)",
         image="Image to post with the announcement (required)",
         notes="Notes posted in the thread, e.g. anything the picture doesn't show (required)",
-        draw="Midday or evening (default: the next one still open)")
+        draw="Midday or evening (default: the next one still open)",
+        bb="90% BB (buyback): the result post shows the winner's buyback, 90% of all tickets (default off)")
     @app_commands.choices(draw=[app_commands.Choice(name="Midday (12:40 PM CT)", value="midday"),
                                 app_commands.Choice(name="Evening (9:22 PM CT)", value="evening")])
     async def start(self, interaction: discord.Interaction, code: str,
                     prize: app_commands.Range[int, 1, 1000000], image: discord.Attachment, notes: str,
-                    draw: app_commands.Choice[str] | None = None):
+                    draw: app_commands.Choice[str] | None = None, bb: bool = False):
         if not isinstance(interaction.channel, discord.TextChannel):
             await interaction.response.send_message(
                 "Run `/fireball start` from a regular text channel. I'll create a thread there for the game.",
@@ -1232,10 +1346,12 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                           interaction.user.display_name, name, day, str(int(prize)), cfg["lock_minutes"],
                           digit_cost=digit_cost_for_prize(int(prize)), code=code,
                           image_url=image.url, notes=notes.strip())
+        board["bb"] = bool(bb)
         image_file = await image.to_file()
         announcement = await interaction.channel.send(
             f"🔥 **Fireball {esc(code)} is open!** {draw_title(board)}\n"
-            f"Prize: **{int(prize)}** (winner takes all). Each digit is worth **{board['digit_cost']}** tickets.\n"
+            f"Prize: **{int(prize)}** (winner takes all). Each digit is worth **{board['digit_cost']}** tickets."
+            f"{' **90% BB** (buyback) is on.' if bb else ''}\n"
             f"Hosted by {interaction.user.mention}. Claims close {ts(board['lock_at'], 'R')}.",
             file=image_file,
         )

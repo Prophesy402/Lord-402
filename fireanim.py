@@ -193,7 +193,8 @@ def render_finale_gif(labels: list[str], elim_order: list[int], winners: list[in
     last = frames[-1].copy()
     d = ImageDraw.Draw(last)
     d.rectangle([0, 0, W, TOP - 2], fill=BG)
-    d.text((14, 11), "LAST THREE STANDING", font=f_big, fill=GOLD)
+    word = {1: "ONE", 2: "TWO", 3: "THREE"}.get(len(winners), str(len(winners)))
+    d.text((14, 11), f"LAST {word} STANDING", font=f_big, fill=GOLD)
     d.text((330, 15), " · ".join(_trim(labels[w], 11) for w in winners), font=f_small, fill=GOLD)
     for w in winners:
         y0 = TOP + w * LANE_H
