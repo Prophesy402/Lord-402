@@ -78,7 +78,7 @@ CONFIG_LIMITS = {
 
 ACTIVE_STATUSES = ("open", "satellite", "animating")
 
-USE_WEBHOOK = True            # steve.py turns this off when Pyro Steve is his own bot
+USE_WEBHOOK = True            # off when the bot running this is Pyro Steve himself (steve.py sets bot.is_pyro_steve)
 PERSONA_NAME = "Pyro Steve"
 PERSONA_AVATAR = Path(__file__).with_name("pyro_steve.png")
 STEVE_LINES = [
@@ -993,7 +993,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
 
     async def _send(self, ch, content: str | None = None, **kw):
         """Post as Pyro Steve when possible (anything without buttons), otherwise as the bot."""
-        if "view" not in kw and USE_WEBHOOK:
+        if "view" not in kw and USE_WEBHOOK and not getattr(self.bot, "is_pyro_steve", False):
             try:
                 hook = await self._hook_for(ch)
                 if hook is None:

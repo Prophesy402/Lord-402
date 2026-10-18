@@ -8,13 +8,10 @@ import logging
 import discord
 from discord.ext import commands
 
-import fireball
-
 log = logging.getLogger("steve")
 
 
 async def run(token: str) -> None:
-    fireball.USE_WEBHOOK = False           # the bot itself is Pyro Steve, no webhook trick needed
     try:
         await _run(token, read_messages=True)    # needed for typed "X2" satellite calls
     except discord.PrivilegedIntentsRequired:
@@ -27,6 +24,9 @@ async def _run(token: str, read_messages: bool) -> None:
     intents = discord.Intents.default()
     intents.message_content = read_messages
     steve = commands.Bot(command_prefix="!", intents=intents)
+    # The bot itself is Pyro Steve, so no webhook trick is needed. This goes on the bot, not the
+    # fireball module: load_extension runs a fresh copy of fireball.py, so a module flag set here is lost.
+    steve.is_pyro_steve = True
 
     @steve.event
     async def setup_hook():
