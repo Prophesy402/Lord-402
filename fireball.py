@@ -796,6 +796,12 @@ def is_admin(interaction: discord.Interaction) -> bool:
     return isinstance(m, discord.Member) and m.guild_permissions.administrator
 
 
+def is_mod(interaction: discord.Interaction) -> bool:
+    """Moderator = Manage Messages (admins have it too), same bar the duck race README uses."""
+    m = interaction.user
+    return isinstance(m, discord.Member) and m.guild_permissions.manage_messages
+
+
 @app_commands.guild_only()
 class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick 3 Fireball digit game"):
     def __init__(self, bot: commands.Bot):
@@ -1593,14 +1599,14 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         found.sort(key=lambda b: b["created_at"])
         return found[-1] if found else None
 
-    @app_commands.command(name="cancel", description="Cancel the live Fireball board here and void every claim")
     async def cancel(self, interaction: discord.Interaction):
+        """/fireball-cancel. A top-level command (not under /fireball) so Discord can hide it from non-mods."""
         board = await self._find_board(interaction, ACTIVE_STATUSES + ("locked",))
         if not board:
             await interaction.response.send_message("No live Fireball board in this channel.", ephemeral=True)
             return
-        if str(interaction.user.id) != board["host_id"] and not is_admin(interaction):
-            await interaction.response.send_message("Only the host or an admin can cancel.", ephemeral=True)
+        if not is_mod(interaction):
+            await interaction.response.send_message("Only moderators can cancel a Fireball board.", ephemeral=True)
             return
         async with self.store.lock:
             b = self.store.data["boards"][board["id"]]
@@ -1669,5 +1675,16 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 "`/fireball result fireball:<digit>`.", ephemeral=True)
 
 
+@app_commands.command(name="fireball-cancel", description="Mods: cancel the live Fireball board here and void every claim")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+async def fireball_cancel(interaction: discord.Interaction):
+    if _active_cog is None:
+        await interaction.response.send_message("Fireball isn't loaded right now.", ephemeral=True)
+        return
+    await _active_cog.cancel(interaction)
+
+
 async def setup(bot: commands.Bot):
     await bot.add_cog(FireballCog(bot))
+    bot.tree.add_command(fireball_cancel, override=True)

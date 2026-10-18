@@ -94,6 +94,6 @@ Played on the **Illinois Pick 3 Fireball** digit (0–9).
 **HOST / ADMIN TOOLS**
 • `/fireball result` — re-check the site, or `fireball:<digit>` to enter it by hand
 • `/fireball notes` — update the host notes
-• `/fireball cancel` — cancel the board; **every claim is void**
+• `/fireball-cancel` — **mods only**: cancel the board; **every claim is void**
 • `/fireball config lock_minutes:` — admins: change the lock time
 ```
