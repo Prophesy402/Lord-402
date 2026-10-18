@@ -80,7 +80,7 @@ CONFIG_LIMITS = {
 ACTIVE_STATUSES = ("open", "satellite", "animating")
 
 USE_WEBHOOK = True            # off when the bot running this is Pyro Steve himself (steve.py sets bot.is_pyro_steve)
-TALLY_EMOJI = "💰"           # on the result post's "Ducks by player" lines; a custom emoji looks like <:name:id>
+TALLY_EMOJI = "💰"           # on the result post's per-player and total lines; a custom emoji looks like <:name:id>
 PERSONA_NAME = "Pyro Steve"
 PERSONA_AVATAR = Path(__file__).with_name("pyro_steve.png")
 STEVE_LINES = [
@@ -243,8 +243,8 @@ def result_text(board: dict, holder: dict | None, fireball: int) -> str:
         per[e["user_id"]] = per.get(e["user_id"], 0) + e["amount"]
     roster = ", ".join(f"{esc(names.get(u, 'Player'))} **{fmt_num(a)}**"
                        for u, a in sorted(per.items(), key=lambda kv: -kv[1]))
-    lines.append(f"{TALLY_EMOJI} **Ducks by player:** {roster or 'none'}\n"
-                 f"{TALLY_EMOJI} **Total ducks from players: {fmt_num(total)}**")
+    lines.append(f"{TALLY_EMOJI} **Per player:** {roster or 'none'}\n"
+                 f"{TALLY_EMOJI} **Total: {fmt_num(total)}**")
     lines.append(f"🦆🔥 *{steve()}*")
     text = "\n".join(lines)
     return text if len(text) <= 1900 else text[:1890] + "…"
