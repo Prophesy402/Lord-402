@@ -320,21 +320,27 @@ def next_draw(now: datetime | None = None, lock_minutes: int = 10) -> tuple[str,
     raise RuntimeError("unreachable")
 
 
-def claim_digits(data: dict, board: dict, user_id: str, name: str, requested: list[int]) -> dict:
+def claim_digits(data: dict, board: dict, user_id: str, name: str, requested: list[int],
+                 close_out: bool = False) -> dict:
     """
     Claim digits for a user. Bulk claims (Odds/Evens) are clamped so the board
     stops at exactly SAT_THRESHOLD claimed digits, same idea as the duck race
-    rounding a call down to what is left.
+    rounding a call down to what is left. close_out (the Close button) skips
+    that limit and takes every digit asked for.
 
-    Returns {"ok": bool, "msg": str, "claimed": [...], "opened_sat": bool}.
+    If that leaves all ten digits claimed, the board locks right away and there's
+    no satellite.
+
+    Returns {"ok": bool, "msg": str, "claimed": [...], "opened_sat": bool, "full": bool}.
     """
     if board["status"] != "open":
-        return {"ok": False, "msg": "This board isn't taking digit claims right now.", "claimed": [], "opened_sat": False}
+        return {"ok": False, "msg": "This board isn't taking digit claims right now.", "claimed": [],
+                "opened_sat": False, "full": False}
     avail = [d for d in requested if not board["digits"][str(d)]]
     if not avail:
-        return {"ok": False, "msg": "Those digits are already taken.", "claimed": [], "opened_sat": False}
+        return {"ok": False, "msg": "Those digits are already taken.", "claimed": [], "opened_sat": False, "full": False}
     pending = bool(board.get("sat_at"))      # grace window: others may still claim before the satellite opens
-    room = (10 if pending else SAT_THRESHOLD) - len(claimed_digits(board))
+    room = (10 if pending or close_out else SAT_THRESHOLD) - len(claimed_digits(board))
     clamped = False
     if len(avail) > room:
         avail = random.sample(avail, room)
@@ -343,15 +349,19 @@ def claim_digits(data: dict, board: dict, user_id: str, name: str, requested: li
     charge(board, user_id, cost, "digit", ",".join(str(d) for d in sorted(avail)))
     for d in avail:
         board["digits"][str(d)] = {"user_id": str(user_id), "name": name, "via": "claim"}
-    opened = False
-    if not pending and len(claimed_digits(board)) >= SAT_THRESHOLD:
+    opened = full = False
+    if len(claimed_digits(board)) == 10:      # main board closed out: no satellite needed
+        board["sat_at"] = None
+        board["status"] = "locked"
+        full = True
+    elif not pending and len(claimed_digits(board)) >= SAT_THRESHOLD:
         board["sat_at"] = (datetime.now(timezone.utc) + timedelta(seconds=SAT_DELAY)).isoformat()
         opened = True      # means: the grace window just started
     shown = ", ".join(str(d) for d in sorted(avail))
     msg = f"You claimed digit **{shown}** for **{cost}** ticket(s). You're in for **{owed(board, user_id)}** on this game."
     if clamped:
         msg += " (Rounded down to what was left before the satellite.)"
-    return {"ok": True, "msg": msg, "claimed": sorted(avail), "opened_sat": opened}
+    return {"ok": True, "msg": msg, "claimed": sorted(avail), "opened_sat": opened, "full": full}
 
 
 def open_satellite(board: dict) -> str | None:
@@ -791,7 +801,7 @@ def sat_embed(board: dict, cfg: dict) -> discord.Embed:
     return emb
 
 
-class BoardButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fb:(?P<board>[0-9a-f]+):(?P<action>d\d|yolo|odds|evens|close|sip|remind|host|admin)"):
+class BoardButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fb:(?P<board>[0-9a-f]+):(?P<action>d\d|yolo|odds|evens|closeout|close|sip|remind|host|admin)"):
     def __init__(self, board_id: str, action: str, label: str = "?", style=discord.ButtonStyle.secondary,
                  disabled: bool = False, row: int | None = None):
         super().__init__(discord.ui.Button(
@@ -931,6 +941,7 @@ def board_view(board: dict) -> discord.ui.View:
     view.add_item(BoardButton(board["id"], "yolo", "🎲 YOLO", discord.ButtonStyle.success, not live, row=2))
     view.add_item(BoardButton(board["id"], "odds", "Odds", discord.ButtonStyle.secondary, not live, row=2))
     view.add_item(BoardButton(board["id"], "evens", "Evens", discord.ButtonStyle.secondary, not live, row=2))
+    view.add_item(BoardButton(board["id"], "closeout", "🏁 Close", discord.ButtonStyle.danger, not live, row=2))
     no_sips = board["status"] == "cancelled" or not board["ledger"]
     view.add_item(BoardButton(board["id"], "sip", "💸 Sip", discord.ButtonStyle.success, no_sips, row=3))
     done = board["status"] == "cancelled"
@@ -1259,7 +1270,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             await self._open_panel(interaction, board_id, admin=action == "admin")
             return
         user = interaction.user
-        opened_sat = False
+        opened_sat = filled = False
         reply = ""
         closed_note = None
         async with self.store.lock:
@@ -1285,14 +1296,18 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                     requested = [random.choice(open_digits(board))] if open_digits(board) else []
                 elif action == "odds":
                     requested = [d for d in open_digits(board) if d % 2 == 1]
+                elif action == "closeout":       # take every open digit, no satellite
+                    requested = open_digits(board)
                 else:  # evens
                     requested = [d for d in open_digits(board) if d % 2 == 0]
-                result = claim_digits(self.store.data, board, str(user.id), user.display_name, requested)
+                result = claim_digits(self.store.data, board, str(user.id), user.display_name, requested,
+                                      close_out=action == "closeout")
                 if not result["ok"]:
                     await interaction.response.send_message(result["msg"], ephemeral=True)
                     return
                 self.store.save()
                 opened_sat = result["opened_sat"]
+                filled = result["full"]
                 reply = result["msg"]
             snapshot = json.loads(json.dumps(board))
 
@@ -1303,6 +1318,10 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             await self._say(snapshot, f"🔒 **Fireball board closed** by {esc(user.display_name)}. {closed_note}".strip())
             await self._tag(snapshot, "CLOSED")
             await self._retire_sat(snapshot)
+        if filled:
+            await self._say(snapshot, f"🏁 **{esc(user.display_name)} closed out the board!** All 10 digits are claimed, "
+                                      f"so there's no satellite. Draw at {ts(snapshot['draw_at'], 't')}.")
+            await self._tag(snapshot, "CLOSED")
         if opened_sat:     # the 7th digit just went: short grace window, then the satellite opens
             await self._say(snapshot, f"⏳ **7 digits are claimed! Burnin' happy!** The satellite opens in {SAT_DELAY} seconds. "
                                       "Last chance to grab a digit on the main board.")

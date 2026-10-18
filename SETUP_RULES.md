@@ -66,13 +66,13 @@ Played on the **Illinois Pick 3 Fireball** digit (0–9).
    • `image` + `notes` — picture and anything it doesn't show (required)
    • `draw` — Midday (12:40 CT) / Evening (9:22 CT), blank = next
    • `bb` — on for **90% buyback** games
-2. The bot opens a thread **[OPEN] - CODE** with the digit board.
+2. The bot opens a thread with the digit board.
 3. Claims lock **10 min before the draw** (or Host Controls → Close).
 
 **PLAYERS — claiming digits**
 • Tap a digit **0–9** to claim it.
 • 🎲 **YOLO** = random open digit. **Odds** / **Evens** = grab all of them.
-• Only claim what you can cover.
+• 🏁 **Close** = take every open digit. Fill all 10 and there's no satellite.
 
 **THE SATELLITE**
 • Once **7 digits** are claimed, there's a **5-second** last call, then
@@ -90,7 +90,7 @@ Played on the **Illinois Pick 3 Fireball** digit (0–9).
 **THE RESULT**
 • Minutes after the draw the bot posts the result from
   illinoislottery.com and tags whoever holds the Fireball digit.
-• Winner takes the prize. In **90% BB** games the post shows the buyback math.
+• Winner takes the prize (**90% BB** games show the buyback math).
 
 **HOST / ADMIN TOOLS**
 • **Host Controls** (host + mods): release a spot someone didn't mean to
