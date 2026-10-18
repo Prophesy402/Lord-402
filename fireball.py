@@ -60,6 +60,7 @@ RESULT_GIVE_UP_HOURS = 6      # then ask the host to enter it by hand
 
 SAT_THRESHOLD = 7             # digits claimed before the satellite opens
 SAT_SPOTS = 10
+SAT_PREF_DELAY = 30           # seconds between the satellite filling and the shuffle (time to set preferences)
 SAT_DELAY = 5                 # seconds after the 7th digit before the satellite opens (last chance for others)
 MIN_ROUNDS, MAX_ROUNDS = 3, 12
 SHUFFLE_DELAY = 2.5           # seconds between shuffle rounds
@@ -354,6 +355,15 @@ def open_satellite(board: dict) -> str | None:
     return "satellite"
 
 
+def start_animation(board: dict) -> bool:
+    """Preference window is over: decide the outcome (using everyone's preferences) and move to the show."""
+    if board["status"] != "satellite" or not all(board["sat"]["spots"]) or board["sat"].get("outcome"):
+        return False
+    board["sat"]["outcome"] = compute_outcome(board)
+    board["status"] = "animating"
+    return True
+
+
 def claim_spot(data: dict, board: dict, user_id: str, name: str, spot: int) -> dict:
     """Claim a satellite spot (0-9). Returns {"ok", "msg", "filled"}."""
     if board["status"] != "satellite":
@@ -365,9 +375,8 @@ def claim_spot(data: dict, board: dict, user_id: str, name: str, spot: int) -> d
     charge(board, user_id, cost, "sat", str(spot))
     spots[spot] = {"user_id": str(user_id), "name": name}
     filled = all(spots)
-    if filled:
-        board["status"] = "animating"
-        board["sat"]["outcome"] = compute_outcome(board)
+    if filled:      # status stays "satellite" for a short while so players can still set preferences
+        board["sat"]["fill_at"] = (datetime.now(timezone.utc) + timedelta(seconds=SAT_PREF_DELAY)).isoformat()
     return {
         "ok": True,
         "msg": f"You're in the satellite ({sum(1 for x in spots if x)}/{SAT_SPOTS}) for **{cost}** ticket(s). You're in for **{owed(board, user_id)}** on this game.",
@@ -453,6 +462,9 @@ def lock_board(data: dict, board: dict) -> str:
     """Close claiming (Close button or draw time). Returns a short note for the channel."""
     note = ""
     board["sat_at"] = None
+    if board["status"] == "satellite" and all(board["sat"]["spots"]):
+        start_animation(board)       # full satellite: skip the rest of the wait, never void a filled one
+        return "The satellite was full, so it is going ahead now."
     if board["status"] == "satellite":
         spots_taken = sum(1 for s in board["sat"]["spots"] if s)
         returned = void_charges(board, ("sat",))
@@ -611,6 +623,8 @@ def sat_embed(board: dict, cfg: dict) -> discord.Embed:
         title="🦆🔥 Fireball Satellite",
         description=(
             f"**{taken}/{SAT_SPOTS}** spots filled · **{board['sat_cost']}** ticket(s) each.\n"
+            + (f"🔔 **The satellite is full!** The shuffle starts {ts(board['sat']['fill_at'], 'R')}. "
+               f"Set your ⭐ Preferences now!\n" if taken == SAT_SPOTS and board['sat'].get('fill_at') and board["status"] == "satellite" else "") +
             f"Tap **X1** to take a spot. When it fills, the ducks are lit on fire and the **last {len(board['sat']['reserved'])} still burning** "
             f"each win one of the open digits: **{reserved}**.\n"
             f"Tap **⭐ Preferences** to rank those digits. Winners get their best available pick.\n\n"
@@ -789,6 +803,9 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 await self._auto_lock(bid)
             elif b["status"] == "open" and b.get("sat_at") and now >= datetime.fromisoformat(b["sat_at"]):
                 await self._open_sat_flow(bid)
+            elif (b["status"] == "satellite" and b["sat"].get("fill_at") and all(b["sat"]["spots"])
+                  and now >= datetime.fromisoformat(b["sat"]["fill_at"])):
+                await self._fill_countdown(bid, wait=0)
             elif b["status"] == "locked" and not b.get("result"):
                 await self._maybe_fetch_result(bid, now)
 
@@ -985,7 +1002,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         await self._refresh(board_id)
         await interaction.followup.send(result["msg"], ephemeral=True)
         if filled:
-            self._start_finale(board_id, animate=True)
+            asyncio.create_task(self._fill_countdown(board_id))
 
     async def on_pref_pick(self, interaction: discord.Interaction, board_id: str, digit: int | None):
         async with self.store.lock:
@@ -1086,6 +1103,27 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
 
     # ---- shuffle + finale ------------------------------------------------
 
+    async def _fill_countdown(self, board_id: str, wait: float | None = None):
+        """Satellite is full: give everyone a moment to rank their digits, then start the shuffle."""
+        if wait is None:
+            async with self.store.lock:
+                b = self.store.data["boards"].get(board_id)
+                if not b or not b["sat"].get("fill_at"):
+                    return
+                wait = max(0.0, (datetime.fromisoformat(b["sat"]["fill_at"]) - datetime.now(timezone.utc)).total_seconds())
+                snap = json.loads(json.dumps(b))
+            await self._sat_say(
+                snap, f"🔔 **The satellite is full!** The shuffle starts in **{int(wait)} seconds**. "
+                      "Tap **⭐ Preferences** now to rank the open digits.")
+        await asyncio.sleep(wait)
+        async with self.store.lock:
+            b = self.store.data["boards"].get(board_id)
+            if not b or not start_animation(b):
+                return
+            self.store.save()
+        await self._refresh(board_id)
+        self._start_finale(board_id, animate=True)
+
     def _start_finale(self, board_id: str, animate: bool):
         if board_id in self.tasks_running and not self.tasks_running[board_id].done():
             return
@@ -1104,7 +1142,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             ch = await self._sat_channel(snap)
 
             if animate and ch is not None:
-                await self._play_shuffle(ch, labels, out)
+                await self._play_shuffle(ch, labels, out, snap["sat"]["spots"])
                 await self._play_fire(ch, labels, out, snap)
 
             async with self.store.lock:
@@ -1141,22 +1179,29 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         except Exception:
             log.exception("Fireball finale crashed for board %s", board_id)
 
-    async def _play_shuffle(self, ch, labels: list[str], out: dict):
+    async def _play_shuffle(self, ch, labels: list[str], out: dict, spots: list | None = None):
+        """Each spin is its own message and stays in the thread, so everyone can read back through them."""
         rounds = out["rounds"]
         total = len(rounds)
-        msg = await ch.send("🌀 **The satellite is full! Shuffling the ducks...**")
+
+        def who(idx: int) -> str:
+            sp = spots[idx] if spots and spots[idx] else None
+            return f"<@{sp['user_id']}>" if sp else esc(labels[idx])
+
+        none = discord.AllowedMentions.none()
+        await ch.send("🌀 **The satellite is full! Spinning the ducks...**")
         await asyncio.sleep(SHUFFLE_DELAY)
         for r, perm in enumerate(rounds, start=1):
             if r < total:
-                top = "\n".join(f"{i + 1}. {esc(labels[idx])}" for i, idx in enumerate(perm[:3]))
-                text = f"🌀 **Shuffle round {r}/{total}** — top 3:\n{top}"
+                top = "\n".join(f"{i + 1}) {who(idx)}" for i, idx in enumerate(perm[:3]))
+                text = f"**Top 3 from spin:**\n{top}\n{total - r} of {total} rounds remaining."
             else:
-                full = "\n".join(f"{i + 1}. {esc(labels[idx])}" for i, idx in enumerate(perm))
-                text = f"🌀 **Final shuffle ({r}/{total})** — full order:\n{full}"
+                full = "\n".join(f"{i + 1}) {who(idx)}" for i, idx in enumerate(perm))
+                text = f"**Final spin, full order:**\n{full}\nThat was the last round. Lighting the ducks on fire..."
             try:
-                await msg.edit(content=text)
+                await ch.send(text, allowed_mentions=none)
             except discord.HTTPException:
-                msg = await ch.send(text)
+                pass
             await asyncio.sleep(SHUFFLE_DELAY)
 
     async def _play_fire(self, ch, labels: list[str], out: dict, board: dict):
