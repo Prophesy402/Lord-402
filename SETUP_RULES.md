@@ -13,19 +13,18 @@ copy everything inside a block and pin it in that game's channel.
 
 **HOSTS — opening a race**
 1. Go to a normal text channel (not a thread) and run `/create race`
-   • `code` — short race code, e.g. ER13
-   • `total_spots` — how many spots (1–200)
-   • `image` — picture of what's being raced for (required)
-   • `notes` — anything the picture doesn't show (required)
-   • `ticket_name` — optional, what to call a spot (default "spot")
-2. The bot posts the announcement and opens a thread named **[OPEN] - CODE**.
+   • `race_name` — e.g. ER13
+   • `value` + `spots` — each spot costs value ÷ spots (100 on 20 = 💰5)
+   • `image` — picture of what's being raced for
+   • `payment_link` — where to send 💰 (blank = your saved `/payinfo`)
+2. The bot posts the announcement and opens a thread for the race.
 3. Spot calls open after a **30-second countdown**. Don't call early.
 
 **PLAYERS — calling spots**
 • Type **X** + a number: `X1`, `X2`, `X5`. Nothing else counts.
 • Calls bigger than what's left get rounded down to what's left.
 • `xclose` grabs every spot that's still open.
-• `!status` shows who has what and who still owes a sip.
+• `!status` shows who has what, what they owe, and who still needs to sip.
 
 **SATELLITES (SATs)**
 • At **70% full**, the host gets asked: reply `yes sats` or `no sats`.

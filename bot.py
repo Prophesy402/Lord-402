@@ -15,7 +15,7 @@ outside the bot, then have people type "confirm" once they're square.
 
 One race is tracked per channel. Typical flow in a race channel:
 
-  1. Host runs /create race code:ER13 total_spots:10
+  1. Host runs /create race race_name:ER13 value:100 spots:20
        -> channel renamed to "[OPEN] - ER13"
   2. People type "X3", "X1", "2", etc. to call spots
        -> bot replies with running total + spots remaining
@@ -111,6 +111,7 @@ def new_race(
     title: str | None = None,
     ticket_label: str = "spot",
     image_url: str | None = None,
+    value: int = 0,
 ) -> dict:
     return {
         "code": code,
@@ -118,6 +119,7 @@ def new_race(
         "ticket_label": ticket_label or "spot",
         "image_url": image_url,
         "size": size,
+        "value": value,              # what the race is worth; each spot costs value / size
         "status": "open",  # open -> pending -> closed -> shuffled -> complete
         "opened_by": opened_by,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -139,6 +141,34 @@ def new_race(
 
 def unit_label(race: dict) -> str:
     return race.get("ticket_label") or "spot"
+
+
+MONEY = "💰"
+PAY_DATA_PATH = Path(__file__).parent / "data" / "fireball.json"   # /payinfo lives with the Fireball game
+
+
+def fmt_money(x: float) -> str:
+    return f"{x:,.2f}".rstrip("0").rstrip(".") if x != int(x) else f"{int(x):,}"
+
+
+def spot_cost(race: dict) -> float:
+    """100 value on 20 spots -> 5 a spot."""
+    return race.get("value", 0) / race["size"] if race.get("value") and race["size"] else 0
+
+
+def cost_note(race: dict, spots: int) -> str:
+    """' · 💰10' for the given number of spots, or nothing on a race with no value set."""
+    c = spot_cost(race)
+    return f" · {MONEY}{fmt_money(c * spots)}" if c else ""
+
+
+def saved_pay(user_id) -> str | None:
+    """Where this person gets paid, as saved with /payinfo set (shared with the Fireball bot)."""
+    try:
+        with PAY_DATA_PATH.open("r", encoding="utf-8") as f:
+            return (json.load(f).get("pay", {}).get(str(user_id)) or {}).get("info")
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def entry_totals(race: dict) -> dict[str, int]:
@@ -383,8 +413,9 @@ async def handle_spot_call(message: discord.Message, spots: int):
 
     if remaining_after > 0:
         await message.reply(
-            f"🦆 **Lord 402** recorded {message.author.mention} calling **{spots}** {unit}(s){clamp_note} "
-            f"({totals[user_id]} total) at {at_str} — **{remaining_after}** {unit}(s) remaining.",
+            f"🦆 **Lord 402** recorded {message.author.mention} calling **{spots}** {unit}(s){clamp_note}"
+            f"{cost_note(race, spots)} ({totals[user_id]} total{cost_note(race, totals[user_id])}) at {at_str} — "
+            f"**{remaining_after}** {unit}(s) remaining.",
             mention_author=False,
         )
 
@@ -399,8 +430,9 @@ async def handle_spot_call(message: discord.Message, spots: int):
             await _notify_sat_threshold(message.channel, race)
     else:
         await message.reply(
-            f"🦆 **Lord 402** recorded {message.author.mention} calling **{spots}** {unit}(s){clamp_note} "
-            f"({totals[user_id]} total) at {at_str} — race is now full.",
+            f"🦆 **Lord 402** recorded {message.author.mention} calling **{spots}** {unit}(s){clamp_note}"
+            f"{cost_note(race, spots)} ({totals[user_id]} total{cost_note(race, totals[user_id])}) at {at_str} — "
+            f"race is now full.",
             mention_author=False,
         )
         race["status"] = "pending"
@@ -408,7 +440,7 @@ async def handle_spot_call(message: discord.Message, spots: int):
         await rename_channel(message.channel, "PENDING", race["code"])
 
         names = participant_names(race)
-        roster_lines = "\n".join(f"- <@{uid}> ({n} {unit}(s))" for uid, n in totals.items())
+        roster_lines = "\n".join(f"- <@{uid}> ({n} {unit}(s){cost_note(race, n)})" for uid, n in totals.items())
         await message.channel.send(
             f"🏁 **RACE IS FULL — {race['title']}**\n"
             f"All {race['size']} {unit}(s) are claimed:\n{roster_lines}\n\n"
@@ -915,7 +947,9 @@ NOTES_MAX_LENGTH = 1800
 
 def _notes_text(race: dict, fallback_author: str) -> str:
     author = race.get("notes_author") or fallback_author
-    return f"📋 **Host notes ({author}):** {race['notes']}"
+    pay = saved_pay(race["opened_by"])
+    pay_line = f"\n{MONEY} **Send to:** {discord.utils.escape_mentions(pay)}" if pay else ""
+    return f"📋 **Host notes ({author}):** {race['notes']}{pay_line}"
 
 
 def _can_edit_notes(interaction: discord.Interaction, race: dict) -> bool:
@@ -1006,20 +1040,24 @@ class NotesEditView(discord.ui.View):
 
 @create_group.command(name="race", description="Open a new duck race in this channel")
 @app_commands.describe(
-    code="Short race code, e.g. ER13",
-    total_spots="Number of spots in the race",
-    image="Image to post with the race announcement (required)",
-    notes="Notes posted below the picture in the thread, e.g. anything the picture doesn't show (required)",
+    race_name="Name of this race, e.g. ER13",
+    value="What the race is worth. Each spot costs value / spots (100 on 20 spots -> 5 a spot)",
+    spots="How many spots in the race",
+    image="Picture to post with the race announcement",
+    payment_link="Where to send 💰 (leave blank to use your saved /payinfo)",
     ticket_name="What to call each spot, e.g. 'ticket' or 'duck' (defaults to 'spot')",
 )
 async def duck_open(
     interaction: discord.Interaction,
-    code: str,
-    total_spots: int,
+    race_name: str,
+    value: app_commands.Range[int, 1, 1000000],
+    spots: app_commands.Range[int, 1, MAX_RACE_SIZE],
     image: discord.Attachment,
-    notes: str,
+    payment_link: str | None = None,
     ticket_name: str | None = None,
 ):
+    code, total_spots = race_name, spots
+    notes = (payment_link or "").strip() or saved_pay(interaction.user.id) or "(no payment link yet)"
     if not interaction.guild_id:
         await interaction.response.send_message("This only works in a server.", ephemeral=True)
         return
@@ -1029,20 +1067,9 @@ async def duck_open(
             ephemeral=True,
         )
         return
-    if total_spots < 1 or total_spots > MAX_RACE_SIZE:
-        await interaction.response.send_message(
-            f"total_spots must be between 1 and {MAX_RACE_SIZE}.", ephemeral=True
-        )
-        return
     if not image.content_type or not image.content_type.startswith("image/"):
         await interaction.response.send_message(
             "That attachment doesn't look like an image — please attach a picture.", ephemeral=True
-        )
-        return
-    if not notes.strip():
-        await interaction.response.send_message(
-            "Notes can't be blank — add a line about anything the picture doesn't show.",
-            ephemeral=True,
         )
         return
 
@@ -1057,6 +1084,7 @@ async def duck_open(
         str(interaction.user.id),
         ticket_label=ticket_name.strip() if ticket_name else "spot",
         image_url=image.url,
+        value=int(value),
     )
 
     unit = unit_label(race)
@@ -1066,7 +1094,8 @@ async def duck_open(
     # a thread off of it — this is what makes the image show up in the channel
     # feed itself, not just inside the thread once you click in.
     announcement = await interaction.channel.send(
-        f"🦆 **{race['title']} is open!** {total_spots} {unit}(s) available.\n"
+        f"🦆 **{race['title']} is open!** {total_spots} {unit}(s) at {MONEY}**{fmt_money(spot_cost(race))}** each "
+        f"(value {MONEY}{fmt_money(value)}).\n"
         f"Hosted by {interaction.user.mention}.\n"
         f"Call {unit}s by typing **X**+number, e.g. `X2` or `X3`.",
         file=image_file,
@@ -1095,26 +1124,34 @@ async def duck_open(
     save_race(thread.id, race)
 
     await interaction.followup.send(f"Race thread created: {thread.mention}")
+    if not payment_link and not saved_pay(interaction.user.id):
+        await interaction.followup.send(
+            "💰 Tip: save your payment link once with `/payinfo set` (Pyro Steve) and you can skip "
+            "typing it on every race.", ephemeral=True)
 
     asyncio.create_task(_run_spot_call_countdown(thread, SPOT_CALL_DELAY_SECONDS))
 
 
 @bot.tree.command(name="racesat", description="Open a satellite race thread linked to this race thread")
 @app_commands.describe(
-    code="Short race code for the satellite race, e.g. ER13-SAT",
-    total_spots="How many spots to make available in the satellite race",
-    image="Image to post with the satellite race announcement (required)",
-    notes="Notes posted below the picture in the satellite thread (required)",
+    race_name="Name of the satellite race, e.g. ER13-SAT",
+    value="What the satellite is worth. Each spot costs value / spots",
+    spots="How many spots in the satellite race",
+    image="Picture to post with the satellite race announcement",
+    payment_link="Where to send 💰 (leave blank to use your saved /payinfo)",
     ticket_name="What to call each spot, e.g. 'ticket' or 'duck' (defaults to 'spot')",
 )
 async def duck_open_sat(
     interaction: discord.Interaction,
-    code: str,
-    total_spots: int,
+    race_name: str,
+    value: app_commands.Range[int, 1, 1000000],
+    spots: app_commands.Range[int, 1, MAX_RACE_SIZE],
     image: discord.Attachment,
-    notes: str,
+    payment_link: str | None = None,
     ticket_name: str | None = None,
 ):
+    code, total_spots = race_name, spots
+    notes = (payment_link or "").strip() or saved_pay(interaction.user.id) or "(no payment link yet)"
     if not interaction.guild_id:
         await interaction.response.send_message("This only works in a server.", ephemeral=True)
         return
@@ -1154,20 +1191,9 @@ async def duck_open_sat(
             ephemeral=True,
         )
         return
-    if total_spots < 1 or total_spots > MAX_RACE_SIZE:
-        await interaction.response.send_message(
-            f"total_spots must be between 1 and {MAX_RACE_SIZE}.", ephemeral=True
-        )
-        return
     if not image.content_type or not image.content_type.startswith("image/"):
         await interaction.response.send_message(
             "That attachment doesn't look like an image — please attach a picture.", ephemeral=True
-        )
-        return
-    if not notes.strip():
-        await interaction.response.send_message(
-            "Notes can't be blank — add a line about anything the picture doesn't show.",
-            ephemeral=True,
         )
         return
 
@@ -1182,6 +1208,7 @@ async def duck_open_sat(
         main_race["opened_by"],
         ticket_label=ticket_name.strip() if ticket_name else "spot",
         image_url=image.url,
+        value=int(value),
     )
     sat_race["is_sat"] = True
     sat_race["sat_parent_id"] = str(main_channel.id)
@@ -1191,8 +1218,8 @@ async def duck_open_sat(
     parent_channel = interaction.channel.parent
 
     announcement = await parent_channel.send(
-        f"🛟 **Satellite race {sat_race['title']} is open!** {total_spots} {unit}(s) available — "
-        f"top finishers move into **{main_race['title']}**.\n"
+        f"🛟 **Satellite race {sat_race['title']} is open!** {total_spots} {unit}(s) at "
+        f"{MONEY}**{fmt_money(spot_cost(sat_race))}** each — top finishers move into **{main_race['title']}**.\n"
         f"Hosted by {interaction.user.mention}.\n"
         f"Call {unit}s by typing **X**+number, e.g. `X2` or `X3`.",
         file=image_file,
@@ -1305,6 +1332,8 @@ def build_status_text(race: dict) -> str:
         f"**{race['title']}** — status: **{race['status']}** — "
         f"{remaining}/{race['size']} {unit}(s) remaining — hosted by <@{race['opened_by']}>"
     ]
+    if spot_cost(race):
+        lines.append(f"{MONEY} Value **{fmt_money(race['value'])}** · **{fmt_money(spot_cost(race))}** a {unit}")
     if race.get("sat_active"):
         if race.get("sat_thread_id"):
             lines.append(
@@ -1325,7 +1354,7 @@ def build_status_text(race: dict) -> str:
                 mark = "🤝"
             else:
                 mark = "⏳"
-            lines.append(f"{mark} {names[uid]} — {count} {unit}(s)")
+            lines.append(f"{mark} {names[uid]} — {count} {unit}(s){cost_note(race, count)}")
 
         unconfirmed = [uid for uid in totals if uid not in race["confirmed"]]
         if unconfirmed and race["status"] == "pending":
