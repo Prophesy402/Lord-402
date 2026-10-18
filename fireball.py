@@ -506,13 +506,9 @@ def sat_embed(board: dict, cfg: dict) -> discord.Embed:
     spots = board["sat"]["spots"]
     taken = sum(1 for s in spots if s)
     reserved = ", ".join(str(d) for d in board["sat"]["reserved"]) or "none"
-    counts: dict[str, int] = {}
-    names: dict[str, str] = {}
-    for sp in spots:
-        if sp:
-            counts[sp["user_id"]] = counts.get(sp["user_id"], 0) + 1
-            names[sp["user_id"]] = sp["name"]
-    entered = ", ".join(esc(names[u]) + (f" x{n}" if n > 1 else "") for u, n in counts.items()) or "nobody yet"
+    roster = "\n".join(
+        f"**{n}\\)** " + (f"<@{sp['user_id']}>" if sp else "")
+        for n, sp in enumerate(spots, start=1))
     prefs = board["sat"].get("prefs") or {}
     pref_text = ""
     if prefs:
@@ -525,7 +521,7 @@ def sat_embed(board: dict, cfg: dict) -> discord.Embed:
             f"Tap **X1** to take a spot. When it fills, the ducks are lit on fire and the **last 3 still burning** "
             f"each win one of the open digits: **{reserved}**.\n"
             f"Tap **⭐ Preferences** to rank those digits. Winners get their best available pick.\n\n"
-            f"**Entered:** {entered}" + pref_text
+            f"{roster}" + pref_text
         ),
         color=0xF1C40F if board["status"] == "satellite" else 0x7F8C8D,
     )
@@ -706,15 +702,51 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
     def _lock_for(self, board_id: str) -> asyncio.Lock:
         return self.edit_locks.setdefault(board_id, asyncio.Lock())
 
-    async def _channel(self, board: dict):
-        cid = int(board["channel_id"])
-        ch = self.bot.get_channel(cid)
+    async def _chan_by_id(self, cid):
+        if not cid:
+            return None
+        ch = self.bot.get_channel(int(cid))
         if ch is None:
             try:
-                ch = await self.bot.fetch_channel(cid)
-            except (discord.NotFound, discord.Forbidden):
+                ch = await self.bot.fetch_channel(int(cid))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 return None
         return ch
+
+    async def _channel(self, board: dict):
+        return await self._chan_by_id(board["channel_id"])
+
+    async def _sat_channel(self, board: dict):
+        """The satellite's own thread; boards made before that existed keep it in the main thread."""
+        ch = await self._chan_by_id(board["sat"].get("thread_id"))
+        return ch if ch is not None else await self._channel(board)
+
+    async def _sat_say(self, board: dict, content: str | None = None, **kw):
+        ch = await self._sat_channel(board)
+        if ch is None:
+            return None
+        try:
+            return await ch.send(content, **kw)
+        except discord.HTTPException:
+            log.exception("Could not post in satellite thread for board %s", board["id"])
+            return None
+
+    async def _tag_sat(self, board: dict, tag: str):
+        tid = board["sat"].get("thread_id")
+        if not tid or not board.get("code"):
+            return
+        ch = await self._chan_by_id(tid)
+        if isinstance(ch, discord.Thread):
+            try:
+                await ch.edit(name=thread_name(tag, "SAT " + board["code"]))
+            except discord.HTTPException:
+                log.warning("Couldn't rename Fireball satellite thread %s", board["id"])
+
+    async def _retire_sat(self, board: dict):
+        """If a satellite thread was left unfilled when the board closed/cancelled, mark it dead."""
+        if board["sat"].get("thread_id") and not board["sat"].get("outcome"):
+            await self._sat_say(board, "🛑 The satellite didn't fill before the board closed. It's cancelled and every spot is void.")
+            await self._tag_sat(board, "CANCELLED")
 
     async def _refresh(self, board_id: str):
         """Re-draw the main board message (and the satellite one if there is one) from current state."""
@@ -732,11 +764,16 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 if board["board_msg_id"]:
                     await ch.get_partial_message(int(board["board_msg_id"])).edit(
                         embed=board_embed(board, cfg), view=board_view(board))
-                if board["sat"]["msg_id"]:
-                    await ch.get_partial_message(int(board["sat"]["msg_id"])).edit(
-                        embed=sat_embed(board, cfg), view=sat_view(board))
             except discord.HTTPException:
                 log.exception("Could not edit Fireball board %s", board_id)
+            try:
+                if board["sat"]["msg_id"]:
+                    sch = await self._sat_channel(board)
+                    if sch is not None:
+                        await sch.get_partial_message(int(board["sat"]["msg_id"])).edit(
+                            embed=sat_embed(board, cfg), view=sat_view(board))
+            except discord.HTTPException:
+                log.exception("Could not edit Fireball satellite for board %s", board_id)
 
     async def _tag(self, board: dict, tag: str):
         """Rename the game's thread to [OPEN]/[CLOSED]/[DONE]/[CANCELLED] - code, like the duck race does."""
@@ -806,6 +843,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         if closed_note is not None:
             await self._say(snapshot, f"🔒 **Fireball board closed** by {esc(user.display_name)}. {closed_note}".strip())
             await self._tag(snapshot, "CLOSED")
+            await self._retire_sat(snapshot)
         if opened_sat:
             await self._post_satellite(board_id)
 
@@ -876,16 +914,57 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 return
             snap = json.loads(json.dumps(board))
             cfg = get_config(self.store.data, board["guild_id"])
-        msg = await self._say(
-            snap,
-            "🦆🔥 **7 digits are claimed. The satellite is open for the last 3!**",
-            embed=sat_embed(snap, cfg), view=sat_view(snap),
-        )
+        main = await self._channel(snap)
+        parent = await self._chan_by_id(snap.get("parent_channel_id"))
+        thread = None
+        if parent is not None and not isinstance(parent, discord.Thread):
+            try:
+                # Same picture as the main game, re-used from the original announcement.
+                file = None
+                try:
+                    orig = await parent.fetch_message(int(snap["announce_msg_id"]))
+                    if orig.attachments:
+                        file = await orig.attachments[0].to_file()
+                except (discord.HTTPException, KeyError, TypeError, ValueError):
+                    file = None
+                main_link = main.mention if main is not None else "the main thread"
+                text = (
+                    f"🦆🔥 **SATELLITE for Fireball {esc(snap.get('code') or '')}** is open! {draw_title(snap)}\n"
+                    f"This is the **satellite**, not the main game. 7 digits are claimed; the last 3 "
+                    f"(**{', '.join(str(d) for d in snap['sat']['reserved'])}**) are decided here. "
+                    f"10 spots at **{snap['sat_cost']}** ticket(s) each; the last 3 ducks still burning win a digit "
+                    f"on the main board.\nMain game: {main_link}")
+                kw = {"file": file} if file is not None else {}
+                ann = await parent.send(text, **kw)
+                thread = await ann.create_thread(
+                    name=thread_name("OPEN", "SAT " + (snap.get("code") or "")), auto_archive_duration=1440)
+                snap["sat"]["announce_msg_id"] = str(ann.id)
+            except discord.HTTPException:
+                log.exception("Could not create the satellite thread for board %s", board_id)
+                thread = None
+        if thread is not None:
+            await thread.send(
+                f"📋 **This is the SATELLITE for Fireball {esc(snap.get('code') or '')}.** "
+                f"Winners are moved onto the main board automatically.\n"
+                f"Host notes: {snap.get('notes') or '(none)'}")
+            msg = await thread.send(embed=sat_embed(snap, cfg), view=sat_view(snap))
+            if main is not None:
+                try:
+                    await main.send(f"🦆🔥 **7 digits are claimed. The satellite is open for the last 3!** Join it here: {thread.mention}")
+                except discord.HTTPException:
+                    pass
+        else:   # couldn't make a thread: fall back to the old in-place satellite
+            msg = await self._say(
+                snap, "🦆🔥 **7 digits are claimed. The satellite is open for the last 3!**",
+                embed=sat_embed(snap, cfg), view=sat_view(snap))
         if msg:
             async with self.store.lock:
                 b = self.store.data["boards"].get(board_id)
                 if b:
                     b["sat"]["msg_id"] = str(msg.id)
+                    if thread is not None:
+                        b["sat"]["thread_id"] = str(thread.id)
+                        b["sat"]["announce_msg_id"] = snap["sat"].get("announce_msg_id")
                     self.store.save()
 
     # ---- shuffle + finale ------------------------------------------------
@@ -905,7 +984,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             out = snap["sat"]["outcome"]
             labels = spot_labels(snap["sat"]["spots"])
             n = len(labels)
-            ch = await self._channel(snap)
+            ch = await self._sat_channel(snap)
 
             if animate and ch is not None:
                 await self._play_shuffle(ch, labels, out)
@@ -918,6 +997,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 snap = json.loads(json.dumps(board))
             await self._refresh(board_id)
             await self._tag(snap, "CLOSED")
+            await self._tag_sat(snap, "DONE")
 
             out = snap["sat"]["outcome"]
             lines = []
@@ -926,11 +1006,21 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 lines.append(
                     f"🎉 Congrats <@{s['user_id']}>! Digit **{d}** on the Fireball board has been called "
                     f"for you ({out.get('how', {}).get(d, 'assigned')}).")
-            await self._say(
+            sat_ch = await self._sat_channel(snap)
+            main_ch = await self._channel(snap)
+            await self._sat_say(
                 snap,
                 "🔥 **The fire has settled.** The last three ducks standing:\n" + "\n".join(lines) +
                 f"\n\nThe board is full. Draw at {ts(snap['draw_at'], 't')}; the result posts automatically.",
             )
+            if sat_ch is not None and main_ch is not None and sat_ch.id != main_ch.id:
+                names = ", ".join(
+                    f"**{esc(snap['sat']['spots'][idx]['name'])}** (digit {d})"
+                    for d, idx in sorted(out["assignment"].items()))
+                await self._say(
+                    snap,
+                    f"🔥 **Satellite done!** {names} moved onto the main board. The board is full. "
+                    f"Draw at {ts(snap['draw_at'], 't')}; the result posts automatically.")
         except Exception:
             log.exception("Fireball finale crashed for board %s", board_id)
 
@@ -960,9 +1050,20 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 render_finale_gif, labels, out["elim_order"], out["winners"], board["id"])
             if len(gif) > 7_500_000:
                 raise RuntimeError(f"finale GIF too big ({len(gif)} bytes)")
-            await ch.send("🔥🔥 **THE DUCKS ARE ON FIRE** 🔥🔥",
-                          file=discord.File(io.BytesIO(gif), filename="duck-fire.gif"))
+            msg = await ch.send("🔥🔥 **THE DUCKS ARE ON FIRE** 🔥🔥",
+                                file=discord.File(io.BytesIO(gif), filename="duck-fire.gif"))
             await asyncio.sleep(seconds * FINALE_WAIT_SCALE)
+            # GIFs loop forever in Discord, so swap it for the still final frame once it has played.
+            try:
+                from PIL import Image
+                im = Image.open(io.BytesIO(gif))
+                im.seek(im.n_frames - 1)
+                png = io.BytesIO()
+                im.convert("RGB").save(png, format="PNG")
+                png.seek(0)
+                await msg.edit(attachments=[discord.File(png, filename="duck-fire-final.png")])
+            except Exception:
+                log.warning("Couldn't swap the finale GIF for a still", exc_info=True)
         except Exception:
             log.warning("Fireball race GIF failed; using the text finale instead", exc_info=True)
             await self._play_fire_text(ch, labels, out, board)
@@ -1014,6 +1115,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         await self._refresh(board_id)
         await self._say(snap, f"🔒 **Fireball claims are closed** for the {snap['draw']} draw. {note}".strip())
         await self._tag(snap, "CLOSED")
+        await self._retire_sat(snap)
 
     async def _maybe_fetch_result(self, board_id: str, now: datetime):
         async with self.store.lock:
@@ -1145,6 +1247,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 "**Create Public Threads** permission in this channel.", ephemeral=True)
             return
 
+        board["parent_channel_id"] = str(interaction.channel_id)
         board["channel_id"] = str(thread.id)
         board["announce_msg_id"] = str(announcement.id)
         notes_msg = await thread.send(f"📋 **Host notes ({esc(interaction.user.display_name)}):** {board['notes']}")
@@ -1186,7 +1289,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
     async def _find_board(self, interaction: discord.Interaction, statuses: tuple[str, ...]) -> dict | None:
         async with self.store.lock:
             found = [b for b in self.store.data["boards"].values()
-                     if b["channel_id"] == str(interaction.channel_id) and b["status"] in statuses]
+                     if str(interaction.channel_id) in (b["channel_id"], str(b["sat"].get("thread_id")))
+                     and b["status"] in statuses]
         found.sort(key=lambda b: b["created_at"])
         return found[-1] if found else None
 
@@ -1212,6 +1316,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             f"🛑 Fireball board cancelled. All claims are void (**{returned}** ticket(s) worth).")
         await self._refresh(snap["id"])
         await self._tag(snap, "CANCELLED")
+        await self._retire_sat(snap)
 
     @app_commands.command(name="config", description="Admin: show or change Fireball settings")
     @app_commands.describe(lock_minutes="Lock claims this many minutes before the draw")

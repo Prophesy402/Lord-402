@@ -204,7 +204,7 @@ def render_finale_gif(labels: list[str], elim_order: list[int], winners: list[in
     paletted = [f.quantize(colors=56, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE) for f in frames]
     buf = io.BytesIO()
     paletted[0].save(buf, format="GIF", save_all=True, append_images=paletted[1:], duration=durations,
-                     loop=0, optimize=False, disposal=1)
+                     loop=1, optimize=False, disposal=1)
     seconds = (RACE_FRAMES * FRAME_MS) / 1000 + 1.5
     return buf.getvalue(), seconds
 
