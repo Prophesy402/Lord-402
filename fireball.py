@@ -17,10 +17,10 @@ How a game runs
      the result from illinoislottery.com, posts it and tags whoever held the
      Fireball digit. (Winner takes the one prize the host set.)
 
-Tickets are a free, game-only currency kept in this module's own wallet. They
-are granted automatically (a daily amount, credited the next time you touch
-the game, so nothing is ever posted unprompted) and refunded on cancelled
-boards. They have no connection to the duck race and no cash value.
+Tickets are a game-only currency, separate from duck races. Players are
+expected to hold enough to cover whatever they call, so the bot does not keep
+balances or block anyone; it just records what each claim costs. Cancelling a
+board voids every claim.
 
 Version 1 is Fireball-only, winner take all. A later "multi" mode (paying
 Fireball + 1st/2nd/3rd ball) can be added without touching the existing flow;
@@ -64,17 +64,9 @@ SHUFFLE_DELAY = 2.5           # seconds between shuffle rounds
 FIRE_DELAY = 2.2              # seconds between finale edits
 
 DEFAULT_CONFIG = {
-    "digit_cost": 1,        # tickets to claim one digit
-    "start_balance": 10,    # tickets a brand-new wallet starts with
-    "daily_grant": 5,       # tickets added per day (midnight Central)
-    "wallet_cap": 30,       # daily grants stop topping up above this
     "lock_minutes": 10,     # board locks this many minutes before the draw
 }
 CONFIG_LIMITS = {
-    "digit_cost": (0, 1000),
-    "start_balance": (0, 100000),
-    "daily_grant": (0, 100000),
-    "wallet_cap": (0, 100000),
     "lock_minutes": (0, 240),
 }
 
@@ -136,7 +128,6 @@ def today_ct() -> date:
 def guild_state(data: dict, guild_id: int | str) -> dict:
     g = data["guilds"].setdefault(str(guild_id), {})
     g.setdefault("config", {})
-    g.setdefault("wallets", {})
     return g
 
 
@@ -146,53 +137,32 @@ def get_config(data: dict, guild_id: int | str) -> dict:
     return cfg
 
 
-def get_wallet(data: dict, guild_id: int | str, user_id: int | str, today: date | None = None) -> dict:
-    """Return the wallet, creating it or applying any daily grants that are due."""
-    today = today or today_ct()
-    cfg = get_config(data, guild_id)
-    wallets = guild_state(data, guild_id)["wallets"]
-    uid = str(user_id)
-    w = wallets.get(uid)
-    if w is None:
-        w = {"balance": cfg["start_balance"], "last_grant": today.isoformat()}
-        wallets[uid] = w
-        return w
-    try:
-        last = date.fromisoformat(w["last_grant"])
-    except (KeyError, ValueError):
-        last = today
-    days = (today - last).days
-    if days > 0:
-        topped = w["balance"] + days * cfg["daily_grant"]
-        # Never take tickets away: only top up to the cap, if below it.
-        w["balance"] = max(w["balance"], min(topped, cfg["wallet_cap"]))
-        w["last_grant"] = today.isoformat()
-    return w
-
-
-def charge(data: dict, board: dict, user_id: str, amount: int, kind: str, slot: str) -> bool:
-    w = get_wallet(data, board["guild_id"], user_id)
-    if w["balance"] < amount:
-        return False
-    w["balance"] -= amount
+def charge(board: dict, user_id: str, amount: int, kind: str, slot: str) -> None:
+    """Record what a claim costs. Players are trusted to cover it; nothing is blocked."""
     if amount:
         board["ledger"].append({"user_id": str(user_id), "amount": amount, "kind": kind, "slot": slot})
-    return True
 
 
-def refund(data: dict, board: dict, kinds: tuple[str, ...] | None = None) -> int:
-    """Return tickets for ledger entries (all, or only certain kinds)."""
+def void_charges(board: dict, kinds: tuple[str, ...] | None = None) -> int:
+    """Drop recorded charges (all, or only certain kinds). Returns the total voided."""
     total = 0
     keep = []
     for entry in board["ledger"]:
         if kinds is None or entry["kind"] in kinds:
-            w = get_wallet(data, board["guild_id"], entry["user_id"])
-            w["balance"] += entry["amount"]
             total += entry["amount"]
         else:
             keep.append(entry)
     board["ledger"] = keep
     return total
+
+
+def owed(board: dict, user_id: str) -> int:
+    return sum(e["amount"] for e in board["ledger"] if e["user_id"] == str(user_id))
+
+
+def digit_cost_for_prize(prize: int) -> int:
+    """Each of the 10 digits is worth a tenth of the prize (prize 500 -> 50 tickets a digit)."""
+    return max(1, math.ceil(prize / 10))
 
 
 def satellite_cost(digit_cost: int) -> int:
@@ -205,7 +175,8 @@ def satellite_cost(digit_cost: int) -> int:
 
 
 def new_board(guild_id, channel_id, host_id, host_name, draw: str, draw_date: date, prize: str, lock_minutes: int,
-              digit_cost: int = 1, sat_cost: int | None = None) -> dict:
+              digit_cost: int = 1, sat_cost: int | None = None, code: str | None = None,
+              image_url: str | None = None, notes: str | None = None, host_mention: str | None = None) -> dict:
     draw_at = datetime.combine(draw_date, DRAW_TIMES[draw], tzinfo=TZ).astimezone(timezone.utc)
     lock_at = draw_at - timedelta(minutes=lock_minutes)
     return {
@@ -220,6 +191,11 @@ def new_board(guild_id, channel_id, host_id, host_name, draw: str, draw_date: da
         "draw_at": draw_at.isoformat(),
         "lock_at": lock_at.isoformat(),
         "prize": prize,
+        "code": code,
+        "image_url": image_url,
+        "notes": notes,
+        "notes_message_id": None,
+        "notes_author": host_name,
         "digit_cost": digit_cost,        # set by the host when the board starts
         "sat_cost": satellite_cost(digit_cost) if sat_cost is None else sat_cost,
         "status": "open",                # open > satellite > animating > locked > settled | cancelled
@@ -274,14 +250,7 @@ def claim_digits(data: dict, board: dict, user_id: str, name: str, requested: li
         avail = random.sample(avail, room)
         clamped = True
     cost = board["digit_cost"] * len(avail)
-    w = get_wallet(data, board["guild_id"], user_id)
-    if w["balance"] < cost:
-        return {
-            "ok": False,
-            "msg": f"You need **{cost}** ticket(s) but only have **{w['balance']}**. Free tickets arrive daily.",
-            "claimed": [], "opened_sat": False,
-        }
-    charge(data, board, user_id, cost, "digit", ",".join(str(d) for d in sorted(avail)))
+    charge(board, user_id, cost, "digit", ",".join(str(d) for d in sorted(avail)))
     for d in avail:
         board["digits"][str(d)] = {"user_id": str(user_id), "name": name, "via": "claim"}
     opened = False
@@ -290,7 +259,7 @@ def claim_digits(data: dict, board: dict, user_id: str, name: str, requested: li
         board["sat"]["reserved"] = open_digits(board)
         opened = True
     shown = ", ".join(str(d) for d in sorted(avail))
-    msg = f"You claimed digit **{shown}** for **{cost}** ticket(s). Balance: **{w['balance']}**."
+    msg = f"You claimed digit **{shown}** for **{cost}** ticket(s). You're in for **{owed(board, user_id)}** on this game."
     if clamped:
         msg += " (Rounded down to what was left before the satellite.)"
     return {"ok": True, "msg": msg, "claimed": sorted(avail), "opened_sat": opened}
@@ -304,10 +273,7 @@ def claim_spot(data: dict, board: dict, user_id: str, name: str, spot: int) -> d
     if spots[spot]:
         return {"ok": False, "msg": "That spot is already taken.", "filled": False}
     cost = board["sat_cost"]
-    w = get_wallet(data, board["guild_id"], user_id)
-    if w["balance"] < cost:
-        return {"ok": False, "msg": f"You need **{cost}** ticket(s) but only have **{w['balance']}**.", "filled": False}
-    charge(data, board, user_id, cost, "sat", str(spot))
+    charge(board, user_id, cost, "sat", str(spot))
     spots[spot] = {"user_id": str(user_id), "name": name}
     filled = all(spots)
     if filled:
@@ -315,7 +281,7 @@ def claim_spot(data: dict, board: dict, user_id: str, name: str, spot: int) -> d
         board["sat"]["outcome"] = compute_outcome(board)
     return {
         "ok": True,
-        "msg": f"You took satellite spot **{spot + 1}** for **{cost}** ticket(s). Balance: **{w['balance']}**.",
+        "msg": f"You took satellite spot **{spot + 1}** for **{cost}** ticket(s). You're in for **{owed(board, user_id)}** on this game.",
         "filled": filled,
     }
 
@@ -399,13 +365,13 @@ def lock_board(data: dict, board: dict) -> str:
     note = ""
     if board["status"] == "satellite":
         spots_taken = sum(1 for s in board["sat"]["spots"] if s)
-        returned = refund(data, board, ("sat",))
+        returned = void_charges(board, ("sat",))
         board["sat"]["spots"] = [None] * SAT_SPOTS
         board["sat"]["reserved"] = []
         board["sat"]["prefs"] = {}
         note = (
             f"The satellite didn't fill ({spots_taken}/{SAT_SPOTS}), so it was cancelled and "
-            f"**{returned}** ticket(s) were returned. Those digits stay unclaimed."
+            f"those **{returned}** ticket(s) of satellite claims are void. Those digits stay unclaimed."
         )
     board["status"] = "locked"
     return note
@@ -514,8 +480,9 @@ def board_embed(board: dict, cfg: dict) -> discord.Embed:
     colors = {"open": 0xE67E22, "satellite": 0xF1C40F, "animating": 0xE74C3C,
               "locked": 0x7F8C8D, "settled": 0x2ECC71, "cancelled": 0x95A5A6}
     emb = discord.Embed(
-        title=f"🔥 Fireball — {draw_title(board)}",
-        description=f"**Prize:** {esc(board['prize'])}  *(winner takes all)*\n\n" + "\n".join(lines),
+        title=f"🔥 Fireball{(' ' + board['code']) if board.get('code') else ''} — {draw_title(board)}",
+        description=(f"**Prize:** {esc(str(board['prize']))}  *(winner takes all)* · "
+                     f"each digit is worth **{board['digit_cost']}**\n\n" + "\n".join(lines)),
         color=colors.get(status, 0xE67E22),
     )
     state_text = {
@@ -595,6 +562,10 @@ class SatButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fs:(?P<boa
             await interaction.response.send_message("Fireball isn't loaded right now.", ephemeral=True)
             return
         await cog.on_sat_click(interaction, self.board_id, self.action)
+
+
+def thread_name(tag: str, code: str | None) -> str:
+    return f"[{tag}] - {code}"[:100] if code else f"[{tag}]"
 
 
 def short(name: str, n: int = 9) -> str:
@@ -765,6 +736,17 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             except discord.HTTPException:
                 log.exception("Could not edit Fireball board %s", board_id)
 
+    async def _tag(self, board: dict, tag: str):
+        """Rename the game's thread to [OPEN]/[CLOSED]/[DONE]/[CANCELLED] - code, like the duck race does."""
+        if not board.get("code"):
+            return
+        ch = await self._channel(board)
+        if isinstance(ch, discord.Thread):
+            try:
+                await ch.edit(name=thread_name(tag, board["code"]))
+            except discord.HTTPException:
+                log.warning("Couldn't rename Fireball thread %s", board["id"])
+
     async def _say(self, board: dict, content: str | None = None, **kw):
         ch = await self._channel(board)
         if ch is None:
@@ -819,8 +801,9 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         await interaction.response.defer()
         await self._refresh(board_id)
         await interaction.followup.send(reply, ephemeral=True)
-        if closed_note:
-            await self._say(snapshot, f"🔒 **Fireball board closed** by {esc(user.display_name)}. {closed_note}")
+        if closed_note is not None:
+            await self._say(snapshot, f"🔒 **Fireball board closed** by {esc(user.display_name)}. {closed_note}".strip())
+            await self._tag(snapshot, "CLOSED")
         if opened_sat:
             await self._post_satellite(board_id)
 
@@ -932,6 +915,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 self.store.save()
                 snap = json.loads(json.dumps(board))
             await self._refresh(board_id)
+            await self._tag(snap, "CLOSED")
 
             out = snap["sat"]["outcome"]
             lines = []
@@ -1012,6 +996,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             snap = json.loads(json.dumps(board))
         await self._refresh(board_id)
         await self._say(snap, f"🔒 **Fireball claims are closed** for the {snap['draw']} draw. {note}".strip())
+        await self._tag(snap, "CLOSED")
 
     async def _maybe_fetch_result(self, board_id: str, now: datetime):
         async with self.store.lock:
@@ -1066,7 +1051,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         )
         if holder:
             via = " (won it in the satellite 🦆)" if holder.get("via") == "satellite" else ""
-            text = f"🏆 <@{holder['user_id']}> held digit **{fireball}**{via} and wins **{snap['prize']}**!"
+            text = f"🏆 <@{holder['user_id']}> held digit **{fireball}**{via} and wins the **{snap['prize']}** prize!"
         else:
             text = f"Nobody held digit **{fireball}**. No winner this draw."
         msg = await self._say(snap, text, embed=emb)
@@ -1076,44 +1061,110 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 b["result_msg_id"] = str(msg.id)
                 self.store.save()
         await self._refresh(board_id)
+        await self._tag(snap, "DONE")
 
     # ---- slash commands --------------------------------------------------
 
-    @app_commands.command(name="start", description="Open a Fireball board for the next Pick 3 draw")
-    @app_commands.describe(prize="What the Fireball winner gets (one prize, winner takes all)",
-                           digit_cost="Game tickets each digit costs (default: the server setting). Satellite spots are priced automatically from it",
-                           draw="Midday or evening (default: the next one still open)")
+    @app_commands.command(name="start", description="Open a Fireball game for the next Pick 3 draw")
+    @app_commands.describe(
+        code="Short game code, e.g. FB18",
+        prize="Prize amount. Each of the 10 digits is worth a tenth of it (500 -> 50 tickets a digit)",
+        image="Image to post with the announcement (required)",
+        notes="Notes posted in the thread, e.g. anything the picture doesn't show (required)",
+        draw="Midday or evening (default: the next one still open)")
     @app_commands.choices(draw=[app_commands.Choice(name="Midday (12:40 PM CT)", value="midday"),
                                 app_commands.Choice(name="Evening (9:22 PM CT)", value="evening")])
-    async def start(self, interaction: discord.Interaction, prize: str,
-                    digit_cost: app_commands.Range[int, 0, 1000] | None = None,
+    async def start(self, interaction: discord.Interaction, code: str,
+                    prize: app_commands.Range[int, 1, 1000000], image: discord.Attachment, notes: str,
                     draw: app_commands.Choice[str] | None = None):
+        if not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "Run `/fireball start` from a regular text channel. I'll create a thread there for the game.",
+                ephemeral=True)
+            return
+        if not image.content_type or not image.content_type.startswith("image/"):
+            await interaction.response.send_message(
+                "That attachment doesn't look like an image. Please attach a picture.", ephemeral=True)
+            return
+        if not notes.strip():
+            await interaction.response.send_message(
+                "Notes can't be blank. Add a line about anything the picture doesn't show.", ephemeral=True)
+            return
+        code = code.strip()[:40]
+        if not code:
+            await interaction.response.send_message("Give the game a short code, e.g. FB18.", ephemeral=True)
+            return
+
         async with self.store.lock:
             cfg = get_config(self.store.data, interaction.guild_id)
-            for b in self.store.data["boards"].values():
-                if b["channel_id"] == str(interaction.channel_id) and b["status"] in ACTIVE_STATUSES:
-                    await interaction.response.send_message(
-                        "There's already a live Fireball board in this channel. Cancel it first with `/fireball cancel`.",
-                        ephemeral=True)
-                    return
-            if draw is None:
-                name, day = next_draw(lock_minutes=cfg["lock_minutes"])
-            else:
-                name = draw.value
-                now = datetime.now(TZ)
-                day = now.date()
-                if now >= datetime.combine(day, DRAW_TIMES[name], tzinfo=TZ) - timedelta(minutes=cfg["lock_minutes"]):
-                    day += timedelta(days=1)
-            board = new_board(interaction.guild_id, interaction.channel_id, interaction.user.id,
-                              interaction.user.display_name, name, day, prize.strip()[:200], cfg["lock_minutes"],
-                              digit_cost=cfg["digit_cost"] if digit_cost is None else int(digit_cost))
-            self.store.data["boards"][board["id"]] = board
-            snap = json.loads(json.dumps(board))
-        await interaction.response.send_message(embed=board_embed(snap, cfg), view=board_view(snap))
-        msg = await interaction.original_response()
+        if draw is None:
+            name, day = next_draw(lock_minutes=cfg["lock_minutes"])
+        else:
+            name = draw.value
+            now = datetime.now(TZ)
+            day = now.date()
+            if now >= datetime.combine(day, DRAW_TIMES[name], tzinfo=TZ) - timedelta(minutes=cfg["lock_minutes"]):
+                day += timedelta(days=1)
+
+        # Posting the picture + thread can take longer than Discord's 3-second window.
+        await interaction.response.defer()
+
+        board = new_board(interaction.guild_id, interaction.channel_id, interaction.user.id,
+                          interaction.user.display_name, name, day, str(int(prize)), cfg["lock_minutes"],
+                          digit_cost=digit_cost_for_prize(int(prize)), code=code,
+                          image_url=image.url, notes=notes.strip())
+        image_file = await image.to_file()
+        announcement = await interaction.channel.send(
+            f"🔥 **Fireball {esc(code)} is open!** {draw_title(board)}\n"
+            f"Prize: **{int(prize)}** (winner takes all). Each digit is worth **{board['digit_cost']}** tickets.\n"
+            f"Hosted by {interaction.user.mention}. Claims close {ts(board['lock_at'], 'R')}.",
+            file=image_file,
+        )
+        try:
+            thread = await announcement.create_thread(name=thread_name("OPEN", code), auto_archive_duration=1440)
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "I don't have permission to create threads here. The bot needs the "
+                "**Create Public Threads** permission in this channel.", ephemeral=True)
+            return
+
+        board["channel_id"] = str(thread.id)
+        board["announce_msg_id"] = str(announcement.id)
+        notes_msg = await thread.send(f"📋 **Host notes ({esc(interaction.user.display_name)}):** {board['notes']}")
+        board["notes_message_id"] = str(notes_msg.id)
+        board_msg = await thread.send(embed=board_embed(board, cfg), view=board_view(board))
+        board["board_msg_id"] = str(board_msg.id)
         async with self.store.lock:
-            self.store.data["boards"][board["id"]]["board_msg_id"] = str(msg.id)
+            self.store.data["boards"][board["id"]] = board
             self.store.save()
+        await interaction.followup.send(f"Fireball thread created: {thread.mention}")
+
+    @app_commands.command(name="notes", description="Host: change the notes on this Fireball game")
+    @app_commands.describe(text="The new notes")
+    async def notes(self, interaction: discord.Interaction, text: str):
+        board = await self._find_board(interaction, ACTIVE_STATUSES + ("locked",))
+        if not board:
+            await interaction.response.send_message("No live Fireball game in this channel.", ephemeral=True)
+            return
+        if str(interaction.user.id) != board["host_id"] and not is_admin(interaction):
+            await interaction.response.send_message("Only the host or an admin can edit the notes.", ephemeral=True)
+            return
+        if not text.strip():
+            await interaction.response.send_message("Notes can't be blank.", ephemeral=True)
+            return
+        content = f"📋 **Host notes ({esc(board.get('notes_author') or interaction.user.display_name)}):** {text.strip()}"
+        async with self.store.lock:
+            self.store.data["boards"][board["id"]]["notes"] = text.strip()
+            self.store.save()
+        ch = await self._channel(board)
+        try:
+            if board.get("notes_message_id") and ch is not None:
+                await ch.get_partial_message(int(board["notes_message_id"])).edit(content=content)
+                await interaction.response.send_message("Notes updated.", ephemeral=True)
+                return
+        except discord.HTTPException:
+            pass
+        await interaction.response.send_message(content)
 
     async def _find_board(self, interaction: discord.Interaction, statuses: tuple[str, ...]) -> dict | None:
         async with self.store.lock:
@@ -1122,7 +1173,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         found.sort(key=lambda b: b["created_at"])
         return found[-1] if found else None
 
-    @app_commands.command(name="cancel", description="Cancel the live Fireball board here and return everyone's tickets")
+    @app_commands.command(name="cancel", description="Cancel the live Fireball board here and void every claim")
     async def cancel(self, interaction: discord.Interaction):
         board = await self._find_board(interaction, ACTIVE_STATUSES + ("locked",))
         if not board:
@@ -1136,53 +1187,22 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             if b["status"] == "animating":
                 await interaction.response.send_message("The satellite is mid-animation. Give it a moment.", ephemeral=True)
                 return
-            returned = refund(self.store.data, b)
+            returned = void_charges(b)
             b["status"] = "cancelled"
             self.store.save()
             snap = json.loads(json.dumps(b))
         await interaction.response.send_message(
-            f"🛑 Fireball board cancelled. **{returned}** ticket(s) returned to players.")
+            f"🛑 Fireball board cancelled. All claims are void (**{returned}** ticket(s) worth).")
         await self._refresh(snap["id"])
-
-    @app_commands.command(name="wallet", description="See your Fireball tickets")
-    async def wallet(self, interaction: discord.Interaction):
-        async with self.store.lock:
-            cfg = get_config(self.store.data, interaction.guild_id)
-            w = get_wallet(self.store.data, interaction.guild_id, interaction.user.id)
-            self.store.save()
-            bal = w["balance"]
-        await interaction.response.send_message(
-            f"🎟️ You have **{bal}** Fireball ticket(s). You get **{cfg['daily_grant']}** free each day "
-            f"(topped up to {cfg['wallet_cap']}). The host sets what a digit and a satellite spot cost on each board.\n"
-            f"*Tickets are game-only and separate from duck races.*",
-            ephemeral=True)
-
-    @app_commands.command(name="grant", description="Admin: give someone Fireball tickets")
-    @app_commands.describe(member="Who gets the tickets", amount="How many (negative removes)")
-    async def grant(self, interaction: discord.Interaction, member: discord.Member, amount: int):
-        if not is_admin(interaction):
-            await interaction.response.send_message("Admins only.", ephemeral=True)
-            return
-        async with self.store.lock:
-            w = get_wallet(self.store.data, interaction.guild_id, member.id)
-            w["balance"] = max(0, w["balance"] + amount)
-            self.store.save()
-            bal = w["balance"]
-        await interaction.response.send_message(f"Done. {member.display_name} now has **{bal}** ticket(s).")
+        await self._tag(snap, "CANCELLED")
 
     @app_commands.command(name="config", description="Admin: show or change Fireball settings")
-    @app_commands.describe(digit_cost="Default tickets per digit (hosts can override per board)",
-                           start_balance="Tickets a new wallet starts with", daily_grant="Free tickets per day",
-                           wallet_cap="Daily grants top up to this much", lock_minutes="Lock claims this many minutes before the draw")
-    async def config(self, interaction: discord.Interaction,
-                     digit_cost: int | None = None, start_balance: int | None = None,
-                     daily_grant: int | None = None, wallet_cap: int | None = None, lock_minutes: int | None = None):
+    @app_commands.describe(lock_minutes="Lock claims this many minutes before the draw")
+    async def config(self, interaction: discord.Interaction, lock_minutes: int | None = None):
         if not is_admin(interaction):
             await interaction.response.send_message("Admins only.", ephemeral=True)
             return
-        changes = {k: v for k, v in dict(
-            digit_cost=digit_cost, start_balance=start_balance,
-            daily_grant=daily_grant, wallet_cap=wallet_cap, lock_minutes=lock_minutes).items() if v is not None}
+        changes = {} if lock_minutes is None else {"lock_minutes": lock_minutes}
         for k, v in changes.items():
             lo, hi = CONFIG_LIMITS[k]
             if not lo <= v <= hi:
