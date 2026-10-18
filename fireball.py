@@ -62,6 +62,7 @@ SAT_THRESHOLD = 7             # digits claimed before the satellite opens
 SAT_SPOTS = 10
 SAT_PREF_DELAY = 30           # seconds between the satellite filling and the shuffle (time to set preferences)
 SAT_DELAY = 5                 # seconds after the 7th digit before the satellite opens (last chance for others)
+SAT_CALL_RE = re.compile(r"^x(\d{1,2})$", re.IGNORECASE)   # typed satellite call, e.g. "X2"
 MIN_ROUNDS, MAX_ROUNDS = 3, 12
 SHUFFLE_DELAY = 2.5           # seconds between shuffle rounds
 FIRE_DELAY = 2.2              # seconds between finale edits (text fallback only)
@@ -398,6 +399,35 @@ def claim_spot(data: dict, board: dict, user_id: str, name: str, spot: int) -> d
         "msg": f"You're in the satellite ({sum(1 for x in spots if x)}/{SAT_SPOTS}) for **{cost}** ticket(s). You're in for **{owed(board, user_id)}** on this game.",
         "filled": filled,
     }
+
+
+def claim_spots(data: dict, board: dict, user_id: str, name: str, count: int) -> dict:
+    """
+    Typed "X#" call: take the next `count` free satellite spots in order, rounded
+    down to what's left (same as a duck race call). Returns
+    {"ok", "msg", "spots": [0-based indexes], "filled", "clamped"}.
+    """
+    if board["status"] != "satellite":
+        return {"ok": False, "msg": "The satellite isn't open.", "spots": [], "filled": False, "clamped": False}
+    spots = board["sat"]["spots"]
+    free = [i for i, s in enumerate(spots) if not s]
+    if not free:
+        return {"ok": False, "msg": "The satellite is full.", "spots": [], "filled": False, "clamped": False}
+    clamped = count > len(free)
+    taken = free[:count]
+    for i in taken:
+        result = claim_spot(data, board, user_id, name, i)
+    return {"ok": True, "msg": result["msg"], "spots": taken, "filled": result["filled"], "clamped": clamped}
+
+
+def spot_claim_line(board: dict, user_id: str, taken: list[int], clamped: bool = False) -> str:
+    """Public line posted in the satellite thread for every claim, like the duck race's spot-call reply."""
+    left = sum(1 for s in board["sat"]["spots"] if not s)
+    nums = ", ".join(f"#{i + 1}" for i in taken)
+    clamp = " (rounded down to what was left)" if clamped else ""
+    tail = "the satellite is **full**! 🔥" if not left else f"**{left}**/{SAT_SPOTS} spot(s) left."
+    return (f"🦆🔥 <@{user_id}> took **{len(taken)}** spot(s){clamp}: **{nums}** · "
+            f"**{board['sat_cost']}** ticket(s) each, in for **{owed(board, user_id)}** — {tail}")
 
 
 def compute_outcome(board: dict, rng: random.Random | None = None) -> dict:
@@ -1061,12 +1091,51 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 return
             self.store.save()
             filled = result["filled"]
+            line = spot_claim_line(board, str(user.id), [spot])
+            snap = json.loads(json.dumps(board))
 
         await interaction.response.defer()
         await self._refresh(board_id)
-        await interaction.followup.send(result["msg"], ephemeral=True)
+        await self._sat_say(snap, line, allowed_mentions=discord.AllowedMentions.none())
         if filled:
             asyncio.create_task(self._fill_countdown(board_id))
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Typed spot calls in the satellite thread: "X2" takes the next 2 free spots."""
+        if message.author.bot or not message.guild:
+            return
+        m = SAT_CALL_RE.match(message.content.strip())
+        if not m:
+            return
+        cid = str(message.channel.id)
+        async with self.store.lock:
+            board = next(
+                (b for b in self.store.data["boards"].values()
+                 if b["status"] == "satellite"
+                 and (b["sat"].get("thread_id") == cid
+                      or (not b["sat"].get("thread_id") and b["channel_id"] == cid))),
+                None)
+            if not board:
+                return
+            count = int(m.group(1))
+            if count < 1:
+                return
+            result = claim_spots(self.store.data, board, str(message.author.id), message.author.display_name, count)
+            if not result["ok"]:
+                reply = result["msg"]
+            else:
+                self.store.save()
+                reply = spot_claim_line(board, str(message.author.id), result["spots"], result["clamped"])
+            board_id = board["id"]
+        try:
+            await message.reply(reply, mention_author=False)
+        except discord.HTTPException:
+            pass
+        if result["ok"]:
+            await self._refresh(board_id)
+            if result["filled"]:
+                asyncio.create_task(self._fill_countdown(board_id))
 
     async def on_pref_pick(self, interaction: discord.Interaction, board_id: str, digit: int | None):
         async with self.store.lock:

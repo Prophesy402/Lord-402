@@ -15,7 +15,17 @@ log = logging.getLogger("steve")
 
 async def run(token: str) -> None:
     fireball.USE_WEBHOOK = False           # the bot itself is Pyro Steve, no webhook trick needed
+    try:
+        await _run(token, read_messages=True)    # needed for typed "X2" satellite calls
+    except discord.PrivilegedIntentsRequired:
+        log.warning("Pyro Steve: turn on Message Content Intent in the Developer Portal for typed "
+                    "satellite calls; running with buttons only")
+        await _run(token, read_messages=False)
+
+
+async def _run(token: str, read_messages: bool) -> None:
     intents = discord.Intents.default()
+    intents.message_content = read_messages
     steve = commands.Bot(command_prefix="!", intents=intents)
 
     @steve.event
@@ -33,5 +43,9 @@ async def run(token: str) -> None:
     try:
         async with steve:
             await steve.start(token)
+    except discord.PrivilegedIntentsRequired:
+        if read_messages:
+            raise
+        log.exception("Pyro Steve stopped; Lord 402 and duck races are unaffected")
     except Exception:
         log.exception("Pyro Steve stopped; Lord 402 and duck races are unaffected")
