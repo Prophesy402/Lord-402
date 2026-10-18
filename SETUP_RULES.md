@@ -77,8 +77,8 @@ Played on the **Illinois Pick 3 Fireball** digit (0–9).
 **THE SATELLITE**
 • Once **7 digits** are claimed, there's a **5-second** last call, then
   the remaining digits go to a **10-spot satellite** in its own thread.
-• Type `X1`, `X2`, etc. in the satellite thread (or tap **X1**) to take
-  spots. Tap **⭐ Preferences** to rank which open digits you want.
+• Tap the **X1** button to take a spot (typing X1 doesn't count).
+  Tap **⭐ Preferences** to rank which open digits you want.
 • When it fills, you get **30 seconds** to set preferences, then the
   ducks get lit on fire 🔥. The **last 3 still burning** each win a digit
   (best pick still free from their preferences, otherwise random).
