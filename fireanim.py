@@ -25,7 +25,7 @@ LABEL_W = 150
 START_X = LABEL_W + 26
 FINISH_X = W - 56
 FRAME_MS = 80
-RACE_FRAMES = 78            # the race itself (~6 s)
+RACE_FRAMES = 125           # the race itself (10 s)
 HOLD_MS = 4500              # last frame stays up this long
 
 BG = (24, 24, 30)
