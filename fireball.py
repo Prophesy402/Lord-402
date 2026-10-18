@@ -54,6 +54,7 @@ TZ = ZoneInfo("America/Chicago")
 # Illinois Pick 3 draw times (Central). Midday ~12:40 PM, evening ~9:22 PM.
 DRAW_TIMES = {"midday": dtime(12, 40), "evening": dtime(21, 22)}
 RESULTS_URL = "https://www.illinoislottery.com/dbg/results/pick3"
+BACKUP_RESULTS_URL = "https://www.lottery.net/illinois/pick-3/numbers"   # when the official site blocks the bot
 RESULT_FIRST_TRY_MIN = 4      # start looking this many minutes after the draw
 RESULT_RETRY_SECONDS = 180    # then retry about every 3 minutes
 RESULT_GIVE_UP_HOURS = 6      # then ask the host to enter it by hand
@@ -696,15 +697,59 @@ def parse_results(page_html: str) -> list[dict]:
     return out
 
 
+_LN_DATE_RE = re.compile(r"([A-Za-z]+) (\d{1,2}), (\d{4}) Draw Payouts")
+_LN_DRAW_RE = re.compile(r"(Midday|Evening) \d{1,2}:\d{2} [AP]M (\d) (\d) (\d) (\d)\b")
+
+
+def parse_backup_results(page_html: str) -> list[dict]:
+    """
+    lottery.net's Illinois Pick 3 page, used when illinoislottery.com blocks the bot (it answers 403).
+    Each date reads like 'October 17, 2026 Draw Payouts Midday 12:40 PM 5 4 7 9 Evening 9:22 PM 6 5 1 7':
+    three balls, then the Fireball, for each draw that's happened.
+    """
+    text = re.sub(r"(?is)<(script|style).*?</\1>", " ", page_html)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", htmllib.unescape(text))
+    dates = list(_LN_DATE_RE.finditer(text))
+    out = []
+    for n, m in enumerate(dates):
+        mon = _MONTHS.get(m.group(1)[:3].lower())
+        if not mon:
+            continue
+        try:
+            d = date(int(m.group(3)), mon, int(m.group(2)))
+        except ValueError:
+            continue
+        chunk = text[m.end(): dates[n + 1].start() if n + 1 < len(dates) else len(text)]
+        for dm in _LN_DRAW_RE.finditer(chunk):
+            out.append({
+                "date": d.isoformat(),
+                "draw": dm.group(1).lower(),
+                "balls": [int(dm.group(i)) for i in (2, 3, 4)],
+                "fireball": int(dm.group(5)),
+            })
+    return out
+
+
 async def fetch_results(session: aiohttp.ClientSession) -> list[dict]:
+    """Official site first; if it blocks us or has nothing, the lottery.net backup."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/124.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml",
     }
-    async with session.get(RESULTS_URL, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+    timeout = aiohttp.ClientTimeout(total=20)
+    try:
+        async with session.get(RESULTS_URL, headers=headers, timeout=timeout) as resp:
+            resp.raise_for_status()
+            found = parse_results(await resp.text())
+        if found:
+            return found
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        log.info("illinoislottery.com unavailable (%r); trying %s", exc, BACKUP_RESULTS_URL)
+    async with session.get(BACKUP_RESULTS_URL, headers=headers, timeout=timeout) as resp:
         resp.raise_for_status()
-        return parse_results(await resp.text())
+        return parse_backup_results(await resp.text())
 
 
 def find_result(results: list[dict], board: dict) -> dict | None:
