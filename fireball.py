@@ -228,9 +228,9 @@ def result_text(board: dict, holder: dict | None, fireball: int) -> str:
         if board.get("bb"):
             bb = total * 0.9
             lines.append(
-                f"Congrats <@{holder['user_id']}>! Total expected tickets were **{fmt_num(total)}**, therefore the buyback is "
+                f"Congrats <@{holder['user_id']}>! Total expected was {TALLY_EMOJI}**{fmt_num(total)}**, therefore the buyback is "
                 f"**{fmt_num(bb)}**, or **{fmt_num(max(0, bb - dc))}** if the winner hasn't sipped.\n"
-                f"**Here's the math:**\n```\nTotal Tickets: {' + '.join(ticket_terms(board)) or '0'} = {fmt_num(total)}\n"
+                f"**Here's the math:**\n```\nTotal: {' + '.join(ticket_terms(board)) or '0'} = {fmt_num(total)}\n"
                 f"Buy back: {fmt_num(total)} * .9 = {fmt_num(bb)}\n"
                 f"Buyback if winner didn't sip: {fmt_num(bb)} - {fmt_num(dc)} = {fmt_num(max(0, bb - dc))}\n```")
         else:
@@ -361,7 +361,7 @@ def claim_digits(data: dict, board: dict, user_id: str, name: str, requested: li
         board["sat_at"] = (datetime.now(timezone.utc) + timedelta(seconds=SAT_DELAY)).isoformat()
         opened = True      # means: the grace window just started
     shown = ", ".join(str(d) for d in sorted(avail))
-    msg = f"You claimed digit **{shown}** for **{cost}** ticket(s). You're in for **{owed(board, user_id)}** on this game."
+    msg = f"You claimed digit **{shown}** for {TALLY_EMOJI}**{cost}**. You're in for {TALLY_EMOJI}**{owed(board, user_id)}** on this game."
     if clamped:
         msg += " (Rounded down to what was left before the satellite.)"
     return {"ok": True, "msg": msg, "claimed": sorted(avail), "opened_sat": opened, "full": full}
@@ -410,7 +410,7 @@ def claim_spot(data: dict, board: dict, user_id: str, name: str, spot: int) -> d
         board["sat"]["fill_at"] = (datetime.now(timezone.utc) + timedelta(seconds=SAT_PREF_DELAY)).isoformat()
     return {
         "ok": True,
-        "msg": f"You're in the satellite ({sum(1 for x in spots if x)}/{SAT_SPOTS}) for **{cost}** ticket(s). You're in for **{owed(board, user_id)}** on this game.",
+        "msg": f"You're in the satellite ({sum(1 for x in spots if x)}/{SAT_SPOTS}) for {TALLY_EMOJI}**{cost}**. You're in for {TALLY_EMOJI}**{owed(board, user_id)}** on this game.",
         "filled": filled,
     }
 
@@ -421,7 +421,7 @@ def spot_claim_line(board: dict, user_id: str, taken: list[int]) -> str:
     nums = ", ".join(f"#{i + 1}" for i in taken)
     tail = "the satellite is **full**! 🔥" if not left else f"**{left}**/{SAT_SPOTS} spot(s) left."
     return (f"🦆🔥 <@{user_id}> took **{len(taken)}** spot(s): **{nums}** · "
-            f"**{board['sat_cost']}** ticket(s) each, in for **{owed(board, user_id)}** — {tail}")
+            f"{TALLY_EMOJI}**{board['sat_cost']}** each, in for {TALLY_EMOJI}**{owed(board, user_id)}** — {tail}")
 
 
 def compute_outcome(board: dict, rng: random.Random | None = None) -> dict:
@@ -674,7 +674,7 @@ def lock_board(data: dict, board: dict) -> str:
         board["sat"]["prefs"] = {}
         note = (
             f"The satellite didn't fill ({spots_taken}/{SAT_SPOTS}), so it was cancelled and "
-            f"those **{returned}** ticket(s) of satellite claims are void. Those digits stay unclaimed."
+            f"those {TALLY_EMOJI}**{returned}** of satellite claims are void. Those digits stay unclaimed."
         )
     board["status"] = "locked"
     return note
@@ -842,13 +842,13 @@ def board_embed(board: dict, cfg: dict) -> discord.Embed:
         "animating": "Satellite is full. The shuffle and the fire are underway...",
         "locked": f"Claims are closed. Draw at {ts(board['draw_at'], 't')}. Result posts automatically.",
         "settled": "Settled. See the result below.",
-        "cancelled": "Cancelled. All tickets were returned.",
+        "cancelled": "Cancelled. Everything was returned.",
     }
     emb.add_field(name="Status", value=state_text_override or state_text.get(status, status), inline=False)
     if board["ledger"] and status != "cancelled":
-        emb.add_field(name="Sips (type `sip` once you've sent the host your tickets)", value=sip_lines(board), inline=False)
+        emb.add_field(name=f"Sips (tap 💸 Sip once you've sent the host your {TALLY_EMOJI})", value=sip_lines(board), inline=False)
     emb.set_footer(
-        text=f"Digit: {board['digit_cost']} ticket(s) · Satellite spot: {board['sat_cost']} (the open digits split 10 ways) · Host: {board['host_name']}"
+        text=f"Digit: {board['digit_cost']} · Satellite spot: {board['sat_cost']} (the open digits split 10 ways) · Host: {board['host_name']}"
     )
     return emb
 
@@ -868,7 +868,7 @@ def sat_embed(board: dict, cfg: dict) -> discord.Embed:
     emb = discord.Embed(
         title="🦆🔥 Fireball Satellite",
         description=(
-            f"**{taken}/{SAT_SPOTS}** spots filled · **{board['sat_cost']}** ticket(s) each.\n"
+            f"**{taken}/{SAT_SPOTS}** spots filled · {TALLY_EMOJI}**{board['sat_cost']}** each.\n"
             + (f"🔔 **The satellite is full!** The shuffle starts {ts(board['sat']['fill_at'], 'R')}. "
                f"Set your ⭐ Preferences now!\n" if taken == SAT_SPOTS and board['sat'].get('fill_at') and board["status"] == "satellite" else "") +
             f"Tap **X1** to take a spot. When it fills, the ducks are lit on fire and the **last {len(board['sat']['reserved'])} still burning** "
@@ -1508,7 +1508,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             return res["msg"]
 
         request = (f"💸 **{esc(member.display_name)}** (<@{uid}>) says they sipped "
-                   f"**{fmt_num(res['amount'])}** ticket(s) for 🔥 Fireball {esc(snap.get('code') or '')} "
+                   f"{TALLY_EMOJI}**{fmt_num(res['amount'])}** for 🔥 Fireball {esc(snap.get('code') or '')} "
                    f"({draw_title(snap)}). Did you get it?\n{jump_url}")
         sent_dm = False
         try:
@@ -1522,7 +1522,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             except discord.HTTPException:
                 log.exception("Couldn't send sip request for board %s", snap["id"])
         await self._refresh(snap["id"])
-        return (f"📨 Your sip for **{fmt_num(res['amount'])}** ticket(s) on Fireball {esc(snap.get('code') or '')} "
+        return (f"📨 Your sip for {TALLY_EMOJI}**{fmt_num(res['amount'])}** on Fireball {esc(snap.get('code') or '')} "
                 f"was sent to the host to confirm" + ("." if sent_dm else " (in the thread, their DMs are closed)."))
 
     def _board_for_channel(self, cid: str) -> dict | None:
@@ -1588,7 +1588,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             host_pay = get_pay(self.store.data, snap["host_id"])
         await interaction.response.send_message(f"🔔 Reminder sent to {len(due)} player(s).{pending_note}", ephemeral=True)
         await self._say(snap, f"🔔 **Sip reminder** for Fireball {esc(snap.get('code') or '')}: {who}\n"
-                              f"Send the host your tickets, then tap **💸 Sip** on the board (or type `sip`).\n"
+                              f"Send the host your {TALLY_EMOJI}, then tap **💸 Sip** on the board (or type `sip`).\n"
                               f"{pay_line(host_pay)}")
 
     async def on_bb_click(self, interaction: discord.Interaction, board_id: str):
@@ -1619,11 +1619,11 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             snap = json.loads(json.dumps(board))
         request = (f"💰 **{esc(interaction.user.display_name)}** (<@{uid}>) took the **90% BB** on "
                    f"🔥 Fireball {esc(snap.get('code') or '')} ({draw_title(snap)}).\n"
-                   f"Send them **{fmt_num(amount)}**"
+                   f"Send them {TALLY_EMOJI}**{fmt_num(amount)}**"
                    + (".\n" if sipped else f" (they never sipped, so one digit's cost, {fmt_num(snap['digit_cost'])}, is taken off).\n")
                    + pay_line(pay).replace("Send to:", "Send their 💰 to:"))
         await interaction.response.send_message(
-            f"✅ The host has your pay info and owes you **{fmt_num(amount)}**.", ephemeral=True)
+            f"✅ The host has your pay info and owes you {TALLY_EMOJI}**{fmt_num(amount)}**.", ephemeral=True)
         try:
             await interaction.message.edit(view=bb_view(board_id, disabled=True))
         except discord.HTTPException:
@@ -1725,7 +1725,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 self.store.save()
                 s = json.loads(json.dumps(board))
             await inter.response.edit_message(
-                content=f"🔓 Released {gone['what']} from **{esc(gone['name'])}**. Their tickets for it are void.", view=None)
+                content=f"🔓 Released {gone['what']} from **{esc(gone['name'])}**. Their {TALLY_EMOJI} for it is void.", view=None)
             note = (f"🔓 {esc(inter.user.display_name)} released {gone['what']} from <@{gone['user_id']}>. "
                     f"It's open again.")
             if value.startswith("s"):
@@ -1764,10 +1764,10 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 self.store.save()
                 code = board.get("code") or ""
             await inter.response.edit_message(
-                content=f"✅ Marked <@{uid}> as sipped (**{fmt_num(amount)}** ticket(s)).", view=None)
+                content=f"✅ Marked <@{uid}> as sipped ({TALLY_EMOJI}**{fmt_num(amount)}**).", view=None)
             try:
                 player = self.bot.get_user(int(uid)) or await self.bot.fetch_user(int(uid))
-                await player.send(f"✅ The host marked your sip as confirmed (**{fmt_num(amount)}** ticket(s)) "
+                await player.send(f"✅ The host marked your sip as confirmed ({TALLY_EMOJI}**{fmt_num(amount)}**) "
                                   f"on Fireball {esc(code)}.")
             except (discord.HTTPException, ValueError):
                 pass
@@ -1787,7 +1787,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                         if s["status"] == "confirmed")
         total = ticket_total(snap)
         await interaction.response.send_message(
-            f"📋 **Expected sips:** **{fmt_num(total)}** ticket(s) · confirmed **{fmt_num(confirmed)}** · "
+            f"📋 **Expected sips:** {TALLY_EMOJI}**{fmt_num(total)}** · confirmed **{fmt_num(confirmed)}** · "
             f"still out **{fmt_num(total - confirmed)}**\n{sip_lines(snap)}", ephemeral=True)
 
     async def panel_close(self, interaction: discord.Interaction, board_id: str):
@@ -1815,9 +1815,9 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         await interaction.response.edit_message(content=f"{interaction.message.content}\n\n{verdict}", view=None)
         game = f"Fireball {esc(snap.get('code') or '')}"
         if approve:
-            note = f"✅ The host confirmed your sip (**{fmt_num(s['amount'])}** ticket(s)) on {game}."
+            note = f"✅ The host confirmed your sip ({TALLY_EMOJI}**{fmt_num(s['amount'])}**) on {game}."
         else:
-            note = (f"❌ The host denied your sip (**{fmt_num(s['amount'])}** ticket(s)) on {game}. "
+            note = (f"❌ The host denied your sip ({TALLY_EMOJI}**{fmt_num(s['amount'])}**) on {game}. "
                     f"Sort it out with them, then sip again.")
         # Tell the player privately; the board's Sips list shows everyone the tally.
         try:
@@ -1894,7 +1894,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                     f"🦆🔥 **SATELLITE for Fireball {esc(snap.get('code') or '')}** is open! {draw_title(snap)}\n"
                     f"This is the **satellite**, not the main game. The last {len(snap['sat']['reserved'])} "
                     f"(**{', '.join(str(d) for d in snap['sat']['reserved'])}**) are decided here. "
-                    f"10 spots at **{snap['sat_cost']}** ticket(s) each; the last {len(snap['sat']['reserved'])} duck(s) still burning win a digit "
+                    f"10 spots at {TALLY_EMOJI}**{snap['sat_cost']}** each; the last {len(snap['sat']['reserved'])} duck(s) still burning win a digit "
                     f"on the main board.\nMain game: {main_link}")
                 kw = {"file": file} if file is not None else {}
                 ann = await parent.send(text, **kw)
@@ -2179,11 +2179,11 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
     @app_commands.command(name="start", description="Open a Fireball game for the next Pick 3 draw")
     @app_commands.describe(
         code="Short game code, e.g. FB18",
-        prize="Prize amount. Each of the 10 digits is worth a tenth of it (500 -> 50 tickets a digit)",
+        prize="Prize amount. Each of the 10 digits is worth a tenth of it (500 -> 50 a digit)",
         image="Image to post with the announcement (required)",
         notes="Notes posted in the thread, e.g. anything the picture doesn't show (required)",
         draw="Midday or evening (default: the next one still open)",
-        bb="90% BB (buyback): the result post shows the winner's buyback, 90% of all tickets (default off)")
+        bb="90% BB (buyback): the result post shows the winner's buyback, 90% of the total (default off)")
     @app_commands.choices(draw=[app_commands.Choice(name="Midday (12:40 PM CT)", value="midday"),
                                 app_commands.Choice(name="Evening (9:22 PM CT)", value="evening")])
     async def start(self, interaction: discord.Interaction, code: str,
@@ -2229,7 +2229,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         image_file = await image.to_file()
         announcement = await interaction.channel.send(
             f"🔥 **Fireball {esc(code)} is open!** {draw_title(board)}\n"
-            f"Prize: **{int(prize)}** (winner takes all). Each digit is worth **{board['digit_cost']}** tickets."
+            f"Prize: **{int(prize)}** (winner takes all). Each digit is worth {TALLY_EMOJI}**{board['digit_cost']}**."
             f"{' **90% BB** (buyback) is on.' if bb else ''}\n"
             f"Hosted by {interaction.user.mention}. Claims close {ts(board['lock_at'], 'R')}.",
             file=image_file,
@@ -2349,7 +2349,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             self.store.save()
             snap = json.loads(json.dumps(b))
         await interaction.response.send_message(
-            f"🛑 Fireball board cancelled. All claims are void (**{returned}** ticket(s) worth).")
+            f"🛑 Fireball board cancelled. All claims are void ({TALLY_EMOJI}**{returned}** worth).")
         await self._refresh(snap["id"])
         await self._tag(snap, "CANCELLED")
         await self._retire_sat(snap)
