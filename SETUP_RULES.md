@@ -63,8 +63,7 @@ Played on the **Illinois Pick 3 Fireball** digit (0–9).
 1. Go to a normal text channel (not a thread) and run `/fireball start`
    • `code` — short game code, e.g. FB18
    • `prize` — each digit costs 1/10 of it (500 → 50 a digit)
-   • `image` — picture for the announcement (required)
-   • `notes` — anything the picture doesn't show (required)
+   • `image` + `notes` — picture and anything it doesn't show (required)
    • `draw` — Midday (12:40 CT) / Evening (9:22 CT), blank = next
    • `bb` — on for **90% buyback** games
 2. The bot opens a thread **[OPEN] - CODE** with the digit board.
@@ -83,13 +82,15 @@ Played on the **Illinois Pick 3 Fireball** digit (0–9).
 • When it fills, you get **30 seconds** to set preferences, then the
   ducks get lit on fire 🔥. The **last 3 still burning** each win a digit
   (best pick still free from their preferences, otherwise random).
-• Not full by lock? Satellite is cancelled and void.
+
+**SIP**
+• Sent the host your tickets? Type `sip` in the thread. The host gets a
+  DM to ✅ confirm or ❌ deny, and the board shows who's sipped.
 
 **THE RESULT**
 • Minutes after the draw the bot posts the result from
   illinoislottery.com and tags whoever holds the Fireball digit.
 • Winner takes the prize. In **90% BB** games the post shows the buyback math.
-• If nobody holds the Fireball digit, there's no winner that draw.
 
 **HOST / ADMIN TOOLS**
 • `/fireball result` — re-check the site, or `fireball:<digit>` to enter it by hand

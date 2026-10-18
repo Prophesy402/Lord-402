@@ -63,6 +63,7 @@ SAT_SPOTS = 10
 SAT_PREF_DELAY = 30           # seconds between the satellite filling and the shuffle (time to set preferences)
 SAT_DELAY = 5                 # seconds after the 7th digit before the satellite opens (last chance for others)
 SAT_CALL_RE = re.compile(r"^x(\d{1,2})$", re.IGNORECASE)   # typed satellite call, e.g. "X2"
+SIP_WORDS = {"sip", "sipped"}                               # "I've sent the host my tickets"
 MIN_ROUNDS, MAX_ROUNDS = 3, 12
 SHUFFLE_DELAY = 2.5           # seconds between shuffle rounds
 FIRE_DELAY = 2.2              # seconds between finale edits (text fallback only)
@@ -504,6 +505,55 @@ def apply_outcome(board: dict) -> None:
     board["status"] = "locked"
 
 
+def request_sip(board: dict, user_id: str, name: str, channel_id: str) -> dict | None:
+    """
+    A player says they've sent the host their tickets. Returns None if they have
+    nothing on this board (ignored, like a bystander typing "sip" in a duck race),
+    else {"ok", "msg", "amount"}; ok means a fresh request should go to the host.
+    """
+    amount = owed(board, user_id)
+    if amount <= 0:
+        return None
+    sips = board.setdefault("sips", {})
+    s = sips.get(str(user_id))
+    if s and s["status"] == "pending":
+        return {"ok": False, "msg": "⏳ Already waiting on the host to confirm your sip.", "amount": amount}
+    if s and s["status"] == "confirmed" and s["amount"] >= amount:
+        return {"ok": False, "msg": "✅ The host already confirmed your sip.", "amount": amount}
+    sips[str(user_id)] = {"name": name, "amount": amount, "status": "pending", "channel_id": str(channel_id)}
+    return {"ok": True, "msg": "", "amount": amount}
+
+
+def decide_sip(board: dict, user_id: str, approve: bool) -> dict | None:
+    """Host's answer to a pending sip. Returns the sip record, or None if there's nothing pending."""
+    s = board.get("sips", {}).get(str(user_id))
+    if not s or s["status"] != "pending":
+        return None
+    s["status"] = "confirmed" if approve else "denied"
+    return s
+
+
+def sip_lines(board: dict) -> str:
+    """One line per player for the board embed: confirmed / waiting on host / denied / not sipped yet."""
+    sips = board.get("sips", {})
+    names = ticket_names(board)
+    lines = []
+    for uid in dict.fromkeys(e["user_id"] for e in board["ledger"]):
+        amount, s = owed(board, uid), sips.get(uid)
+        name = esc(names.get(uid) or (s or {}).get("name") or "Player")
+        if s and s["status"] == "confirmed":
+            short_by = amount - s["amount"]
+            lines.append(f"✅ {name} **{fmt_num(s['amount'])}**" + (f" · owes **{fmt_num(short_by)}** more" if short_by > 0 else ""))
+        elif s and s["status"] == "pending":
+            lines.append(f"⏳ {name} **{fmt_num(amount)}** · waiting on host")
+        elif s and s["status"] == "denied":
+            lines.append(f"❌ {name} **{fmt_num(amount)}** · host denied")
+        else:
+            lines.append(f"💤 {name} **{fmt_num(amount)}** · not sipped")
+    text = "\n".join(lines)
+    return text if len(text) <= 1024 else text[:1020] + "…"
+
+
 def lock_board(data: dict, board: dict) -> str:
     """Close claiming (Close button or draw time). Returns a short note for the channel."""
     note = ""
@@ -646,6 +696,8 @@ def board_embed(board: dict, cfg: dict) -> discord.Embed:
         "cancelled": "Cancelled. All tickets were returned.",
     }
     emb.add_field(name="Status", value=state_text_override or state_text.get(status, status), inline=False)
+    if board["ledger"] and status != "cancelled":
+        emb.add_field(name="Sips (type `sip` once you've sent the host your tickets)", value=sip_lines(board), inline=False)
     emb.set_footer(
         text=f"Digit: {board['digit_cost']} ticket(s) · Satellite spot: {board['sat_cost']} (the open digits split 10 ways) · Host: {board['host_name']}"
     )
@@ -718,6 +770,36 @@ class SatButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fs:(?P<boa
             await interaction.response.send_message("Fireball isn't loaded right now.", ephemeral=True)
             return
         await cog.on_sat_click(interaction, self.board_id, self.action)
+
+
+class SipButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fp:(?P<board>[0-9a-f]+):(?P<user>\d+):(?P<action>ok|no)"):
+    """Confirm / Deny on a sip request in the host's DMs. Survives restarts like the board buttons."""
+
+    def __init__(self, board_id: str, user_id: str, action: str):
+        ok = action == "ok"
+        super().__init__(discord.ui.Button(
+            label="Confirm" if ok else "Deny", emoji="✅" if ok else "❌",
+            style=discord.ButtonStyle.success if ok else discord.ButtonStyle.danger,
+            custom_id=f"fp:{board_id}:{user_id}:{action}"))
+        self.board_id, self.user_id, self.action = board_id, user_id, action
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(match["board"], match["user"], match["action"])
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = _active_cog
+        if cog is None:
+            await interaction.response.send_message("Fireball isn't loaded right now.", ephemeral=True)
+            return
+        await cog.on_sip_decision(interaction, self.board_id, self.user_id, self.action == "ok")
+
+
+def sip_view(board_id: str, user_id: str) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(SipButton(board_id, user_id, "ok"))
+    view.add_item(SipButton(board_id, user_id, "no"))
+    return view
 
 
 def thread_name(tag: str, code: str | None) -> str:
@@ -817,7 +899,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
     async def cog_load(self):
         global _active_cog
         _active_cog = self
-        self.bot.add_dynamic_items(BoardButton, SatButton)
+        self.bot.add_dynamic_items(BoardButton, SatButton, SipButton)
         self.session = aiohttp.ClientSession()
         self.tick.start()
 
@@ -1108,8 +1190,11 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """Typed spot calls in the satellite thread: "X2" takes the next 2 free spots."""
+        """Typed spot calls in the satellite thread ("X2" takes the next 2 free spots), and "sip"."""
         if message.author.bot or not message.guild:
+            return
+        if message.content.strip().lower() in SIP_WORDS:
+            await self._handle_sip(message)
             return
         m = SAT_CALL_RE.match(message.content.strip())
         if not m:
@@ -1142,6 +1227,83 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             await self._refresh(board_id)
             if result["filled"]:
                 asyncio.create_task(self._fill_countdown(board_id))
+
+    async def _handle_sip(self, message: discord.Message):
+        """Player typed "sip": record it and send the host a Confirm / Deny request in their DMs."""
+        cid, uid = str(message.channel.id), str(message.author.id)
+        async with self.store.lock:
+            found = sorted(
+                (b for b in self.store.data["boards"].values()
+                 if b["status"] != "cancelled" and cid in (b["channel_id"], str(b["sat"].get("thread_id")))),
+                key=lambda b: b["created_at"])
+            if not found:
+                return
+            board = found[-1]
+            res = request_sip(board, uid, message.author.display_name, cid)
+            if res is None:
+                return              # nothing on this board, nothing to sip
+            if res["ok"]:
+                self.store.save()
+            snap = json.loads(json.dumps(board))
+        if not res["ok"]:
+            try:
+                await message.reply(res["msg"], mention_author=False)
+            except discord.HTTPException:
+                pass
+            return
+
+        request = (f"💸 **{esc(message.author.display_name)}** (<@{uid}>) says they sipped "
+                   f"**{fmt_num(res['amount'])}** ticket(s) for 🔥 Fireball {esc(snap.get('code') or '')} "
+                   f"({draw_title(snap)}). Did you get it?\n{message.jump_url}")
+        sent_dm = False
+        try:
+            host = self.bot.get_user(int(snap["host_id"])) or await self.bot.fetch_user(int(snap["host_id"]))
+            await host.send(request, view=sip_view(snap["id"], uid))
+            sent_dm = True
+        except (discord.HTTPException, ValueError):
+            # Host has DMs closed: put the buttons in the thread instead (only the host or an admin can press them).
+            try:
+                await message.channel.send(f"<@{snap['host_id']}> {request}", view=sip_view(snap["id"], uid))
+            except discord.HTTPException:
+                log.exception("Couldn't send sip request for board %s", snap["id"])
+        try:
+            await message.reply(
+                f"📨 Sip for **{fmt_num(res['amount'])}** ticket(s) sent to the host"
+                + (" to confirm." if sent_dm else " here to confirm (their DMs are closed)."),
+                mention_author=False)
+        except discord.HTTPException:
+            pass
+        await self._refresh(snap["id"])
+
+    async def on_sip_decision(self, interaction: discord.Interaction, board_id: str, user_id: str, approve: bool):
+        async with self.store.lock:
+            board = self.store.data["boards"].get(board_id)
+            if not board:
+                await interaction.response.send_message("That Fireball game is gone.", ephemeral=True)
+                return
+            if str(interaction.user.id) != board["host_id"] and not is_admin(interaction):
+                await interaction.response.send_message("Only the host or an admin can confirm sips.", ephemeral=True)
+                return
+            s = decide_sip(board, user_id, approve)
+            if s is None:
+                await interaction.response.send_message("That sip was already handled.", ephemeral=True)
+                return
+            self.store.save()
+            snap = json.loads(json.dumps(board))
+        verdict = "✅ **Confirmed**" if approve else "❌ **Denied**"
+        await interaction.response.edit_message(content=f"{interaction.message.content}\n\n{verdict}", view=None)
+        if approve:
+            text = f"✅ <@{snap['host_id']}> confirmed <@{user_id}>'s sip (**{fmt_num(s['amount'])}** ticket(s))."
+        else:
+            text = (f"❌ <@{snap['host_id']}> denied <@{user_id}>'s sip (**{fmt_num(s['amount'])}** ticket(s)). "
+                    f"Sort it out with the host, then type `sip` again.")
+        ch = await self._chan_by_id(s.get("channel_id")) or await self._channel(snap)
+        if ch is not None:
+            try:
+                await self._send(ch, text)
+            except discord.HTTPException:
+                pass
+        await self._refresh(board_id)
 
     async def on_pref_pick(self, interaction: discord.Interaction, board_id: str, digit: int | None):
         async with self.store.lock:
