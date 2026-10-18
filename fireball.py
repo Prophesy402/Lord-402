@@ -76,6 +76,20 @@ CONFIG_LIMITS = {
 
 ACTIVE_STATUSES = ("open", "satellite", "animating")
 
+PERSONA_NAME = "Pyro Steve"
+PERSONA_AVATAR = Path(__file__).with_name("pyro_steve.png")
+STEVE_LINES = [
+    "Quack chaos!", "Burnin' happy!", "Every day I'm flaming awesome!",
+    "*sips bourbon, ducks on fire*", "Numbers go brrr, feathers go crispy.",
+    "Quack quack, hold my bourbon!", "Smells like victory and singed feathers.",
+    "The thread is NOT on fire. (The thread is a little on fire.)",
+]
+
+
+def steve() -> str:
+    return random.choice(STEVE_LINES)
+
+
 BURN_QUIPS = [
     "A flame sputters out...",
     "Somebody's duck just ran out of luck...",
@@ -215,7 +229,7 @@ def result_text(board: dict, holder: dict | None, fireball: int) -> str:
                 f"Buy back: {fmt_num(total)} * .9 = {fmt_num(bb)}\n"
                 f"Buyback if winner didn't sip: {fmt_num(bb)} - {fmt_num(dc)} = {fmt_num(max(0, bb - dc))}\n```")
         else:
-            lines.append(f"🏆 Congrats <@{holder['user_id']}>! Digit **{fireball}**{via} wins the **{esc(str(board['prize']))}** prize!")
+            lines.append(f"🏆 Quack chaos! Congrats <@{holder['user_id']}>! Digit **{fireball}**{via} wins the **{esc(str(board['prize']))}** prize!")
     else:
         lines.append(f"Nobody held digit **{fireball}**. No winner this draw.")
     names = ticket_names(board)
@@ -225,6 +239,7 @@ def result_text(board: dict, holder: dict | None, fireball: int) -> str:
     roster = ", ".join(f"{esc(names.get(u, 'Player'))} **{fmt_num(a)}**"
                        for u, a in sorted(per.items(), key=lambda kv: -kv[1]))
     lines.append(f"🎟️ **Tickets by player:** {roster or 'none'}\n🎟️ **Total tickets from players: {fmt_num(total)}**")
+    lines.append(f"🦆🔥 *{steve()}*")
     text = "\n".join(lines)
     return text if len(text) <= 1900 else text[:1890] + "…"
 
@@ -833,12 +848,48 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         ch = await self._chan_by_id(board["sat"].get("thread_id"))
         return ch if ch is not None else await self._channel(board)
 
+    async def _hook_for(self, ch):
+        """A 'Pyro Steve' webhook on the channel (made on first use). None if we can't (no permission)."""
+        parent = ch.parent if isinstance(ch, discord.Thread) else ch
+        pid = getattr(parent, "id", None)
+        if pid is None or not hasattr(parent, "webhooks"):
+            return None
+        cache = self.__dict__.setdefault("_hooks", {})
+        if pid in cache:
+            return cache[pid] or None
+        hook = None
+        try:
+            for h in await parent.webhooks():
+                if h.name == PERSONA_NAME and h.user is not None and h.user.id == self.bot.user.id:
+                    hook = h
+                    break
+            if hook is None:
+                avatar = PERSONA_AVATAR.read_bytes() if PERSONA_AVATAR.exists() else None
+                hook = await parent.create_webhook(name=PERSONA_NAME, avatar=avatar)
+        except (discord.Forbidden, discord.HTTPException, OSError):
+            log.warning("Can't create the %s webhook in channel %s; posting as the bot instead", PERSONA_NAME, pid)
+            hook = None
+        cache[pid] = hook or False
+        return hook
+
+    async def _send(self, ch, content: str | None = None, **kw):
+        """Post as Pyro Steve when possible (anything without buttons), otherwise as the bot."""
+        if "view" not in kw:
+            try:
+                hook = await self._hook_for(ch)
+                if hook is not None:
+                    extra = {"thread": ch} if isinstance(ch, discord.Thread) else {}
+                    return await hook.send(content, wait=True, **extra, **kw)
+            except (discord.HTTPException, ValueError, TypeError):
+                log.warning("Pyro Steve webhook post failed; falling back to the bot", exc_info=True)
+        return await ch.send(content, **kw)
+
     async def _sat_say(self, board: dict, content: str | None = None, **kw):
         ch = await self._sat_channel(board)
         if ch is None:
             return None
         try:
-            return await ch.send(content, **kw)
+            return await self._send(ch, content, **kw)
         except discord.HTTPException:
             log.exception("Could not post in satellite thread for board %s", board["id"])
             return None
@@ -903,7 +954,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         if ch is None:
             return None
         try:
-            return await ch.send(content, **kw)
+            return await self._send(ch, content, **kw)
         except discord.HTTPException:
             log.exception("Could not post in channel for board %s", board["id"])
             return None
@@ -957,7 +1008,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             await self._tag(snapshot, "CLOSED")
             await self._retire_sat(snapshot)
         if opened_sat:     # the 7th digit just went: short grace window, then the satellite opens
-            await self._say(snapshot, f"⏳ **7 digits are claimed!** The satellite opens in {SAT_DELAY} seconds. "
+            await self._say(snapshot, f"⏳ **7 digits are claimed! Burnin' happy!** The satellite opens in {SAT_DELAY} seconds. "
                                       "Last chance to grab a digit on the main board.")
             asyncio.create_task(self._open_sat_flow(board_id, delay=SAT_DELAY))
 
@@ -1113,8 +1164,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 wait = max(0.0, (datetime.fromisoformat(b["sat"]["fill_at"]) - datetime.now(timezone.utc)).total_seconds())
                 snap = json.loads(json.dumps(b))
             await self._sat_say(
-                snap, f"🔔 **The satellite is full!** The shuffle starts in **{int(wait)} seconds**. "
-                      "Tap **⭐ Preferences** now to rank the open digits.")
+                snap, f"🔔 **The satellite is full! Quack chaos!** The shuffle starts in **{int(wait)} seconds**. "
+                      "Tap **⭐ Preferences** now to rank the open digits, before I set them on fire.")
         await asyncio.sleep(wait)
         async with self.store.lock:
             b = self.store.data["boards"].get(board_id)
@@ -1165,8 +1216,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             main_ch = await self._channel(snap)
             await self._sat_say(
                 snap,
-                "🔥 **The fire has settled.** The last ducks standing:\n" + "\n".join(lines) +
-                f"\n\nThe board is full. Draw at {ts(snap['draw_at'], 't')}; the result posts automatically.",
+                "🔥 **The fire has settled. Burnin' happy!** The last ducks standing:\n" + "\n".join(lines) +
+                f"\n\nThe board is full. Draw at {ts(snap['draw_at'], 't')}. I'll be back with the numbers. {steve()}",
             )
             if sat_ch is not None and main_ch is not None and sat_ch.id != main_ch.id:
                 names = ", ".join(
@@ -1174,7 +1225,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                     for d, idx in sorted(out["assignment"].items()))
                 await self._say(
                     snap,
-                    f"🔥 **Satellite done!** {names} moved onto the main board. The board is full. "
+                    f"🔥 **Satellite done! Every day I'm flaming awesome!** {names} moved onto the main board. The board is full. "
                     f"Draw at {ts(snap['draw_at'], 't')}; the result posts automatically.")
         except Exception:
             log.exception("Fireball finale crashed for board %s", board_id)
@@ -1189,7 +1240,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             return f"<@{sp['user_id']}>" if sp else esc(labels[idx])
 
         none = discord.AllowedMentions.none()
-        await ch.send("🌀 **The satellite is full! Spinning the ducks...**")
+        await self._send(ch, f"🌀 **Spinning the ducks!** {steve()}")
         await asyncio.sleep(SHUFFLE_DELAY)
         for r, perm in enumerate(rounds, start=1):
             if r < total:
@@ -1197,9 +1248,9 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 text = f"**Top 3 from spin:**\n{top}\n{total - r} of {total} rounds remaining."
             else:
                 full = "\n".join(f"{i + 1}) {who(idx)}" for i, idx in enumerate(perm))
-                text = f"**Final spin, full order:**\n{full}\nThat was the last round. Lighting the ducks on fire..."
+                text = f"**Final spin, full order:**\n{full}\nThat was the last round. Time to light these ducks up! 🔥"
             try:
-                await ch.send(text, allowed_mentions=none)
+                await self._send(ch, text, allowed_mentions=none)
             except discord.HTTPException:
                 pass
             await asyncio.sleep(SHUFFLE_DELAY)
@@ -1212,8 +1263,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 render_finale_gif, labels, out["elim_order"], out["winners"], board["id"])
             if len(gif) > 7_500_000:
                 raise RuntimeError(f"finale GIF too big ({len(gif)} bytes)")
-            msg = await ch.send("🔥🔥 **THE DUCKS ARE ON FIRE** 🔥🔥",
-                                file=discord.File(io.BytesIO(gif), filename="duck-fire.gif"))
+            msg = await self._send(ch, "🔥🔥 **THE DUCKS ARE ON FIRE** 🔥🔥 *Quack chaos!*",
+                                   file=discord.File(io.BytesIO(gif), filename="duck-fire.gif"))
             await asyncio.sleep(seconds * FINALE_WAIT_SCALE)
             # GIFs loop forever in Discord, so swap it for the still final frame once it has played.
             try:
@@ -1243,7 +1294,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                     rows.append(f"{icons[state[i]]} **{esc(lab)}**")
             return "🔥🔥 **THE DUCKS ARE ON FIRE** 🔥🔥\n" + "\n".join(rows) + f"\n\n*{note}*"
 
-        msg = await ch.send(render("Ten ducks. Three survive. Nobody is safe..."))
+        msg = await self._send(ch, render("Ten ducks. Three survive. Nobody is safe..."))
         await asyncio.sleep(FIRE_DELAY)
         quips = BURN_QUIPS[:]
         random.shuffle(quips)
