@@ -718,6 +718,12 @@ async def setup_hook():
     # Re-attach the persistent Edit-notes button so it keeps working on
     # notes messages posted before a restart.
     bot.add_view(NotesEditView())
+    # Fireball (Illinois Pick 3) side game lives in its own file, fireball.py.
+    # If it ever fails to load, duck races keep working exactly as before.
+    try:
+        await bot.load_extension("fireball")
+    except Exception:
+        log.exception("Fireball module failed to load; duck races are unaffected")
 
 
 @bot.event
