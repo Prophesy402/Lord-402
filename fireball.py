@@ -882,6 +882,51 @@ def sip_view(board_id: str, user_id: str) -> discord.ui.View:
     return view
 
 
+NOTES_MAX_LENGTH = 1800
+
+
+def notes_text(board: dict, fallback_author: str) -> str:
+    return f"📋 **Host notes ({esc(board.get('notes_author') or fallback_author)}):** {board.get('notes') or ''}"
+
+
+class NotesButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fn:(?P<board>[0-9a-f]+)"):
+    """✏️ Edit notes under the host notes, like the duck race one. Survives restarts."""
+
+    def __init__(self, board_id: str):
+        super().__init__(discord.ui.Button(label="Edit notes", emoji="✏️", style=discord.ButtonStyle.secondary,
+                                           custom_id=f"fn:{board_id}"))
+        self.board_id = board_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(match["board"])
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = _active_cog
+        if cog is None:
+            await interaction.response.send_message("Fireball isn't loaded right now.", ephemeral=True)
+            return
+        await cog.open_notes_editor(interaction, self.board_id)
+
+
+def notes_view(board_id: str) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(NotesButton(board_id))
+    return view
+
+
+class NotesModal(discord.ui.Modal, title="Edit host notes"):
+    def __init__(self, cog, board_id: str, current: str):
+        super().__init__()
+        self.cog, self.board_id = cog, board_id
+        self.notes_input = discord.ui.TextInput(label="Notes", style=discord.TextStyle.paragraph,
+                                                default=current[:NOTES_MAX_LENGTH], max_length=NOTES_MAX_LENGTH)
+        self.add_item(self.notes_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.cog.set_notes(interaction, self.board_id, self.notes_input.value)
+
+
 def thread_name(tag: str, code: str | None) -> str:
     return f"[{tag}] - {code}"[:100] if code else f"[{tag}]"
 
@@ -1031,7 +1076,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
     async def cog_load(self):
         global _active_cog
         _active_cog = self
-        self.bot.add_dynamic_items(BoardButton, SatButton, SipButton)
+        self.bot.add_dynamic_items(BoardButton, SatButton, SipButton, NotesButton)
         self.session = aiohttp.ClientSession()
         self.tick.start()
 
@@ -2040,7 +2085,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         board["parent_channel_id"] = str(interaction.channel_id)
         board["channel_id"] = str(thread.id)
         board["announce_msg_id"] = str(announcement.id)
-        notes_msg = await thread.send(f"📋 **Host notes ({esc(interaction.user.display_name)}):** {board['notes']}")
+        notes_msg = await thread.send(notes_text(board, interaction.user.display_name), view=notes_view(board["id"]))
         board["notes_message_id"] = str(notes_msg.id)
         board_msg = await thread.send(embed=board_embed(board, cfg), view=board_view(board))
         board["board_msg_id"] = str(board_msg.id)
@@ -2056,25 +2101,58 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         if not board:
             await interaction.response.send_message("No live Fireball game in this channel.", ephemeral=True)
             return
-        if str(interaction.user.id) != board["host_id"] and not is_admin(interaction):
-            await interaction.response.send_message("Only the host or an admin can edit the notes.", ephemeral=True)
-            return
-        if not text.strip():
-            await interaction.response.send_message("Notes can't be blank.", ephemeral=True)
-            return
-        content = f"📋 **Host notes ({esc(board.get('notes_author') or interaction.user.display_name)}):** {text.strip()}"
+        await self.set_notes(interaction, board["id"], text)
+
+    async def open_notes_editor(self, interaction: discord.Interaction, board_id: str):
+        """✏️ Edit notes button: pop-up pre-filled with the current notes."""
         async with self.store.lock:
-            self.store.data["boards"][board["id"]]["notes"] = text.strip()
-            self.store.save()
-        ch = await self._channel(board)
-        try:
-            if board.get("notes_message_id") and ch is not None:
-                await ch.get_partial_message(int(board["notes_message_id"])).edit(content=content)
-                await interaction.response.send_message("Notes updated.", ephemeral=True)
+            board = self.store.data["boards"].get(board_id)
+            snap = json.loads(json.dumps(board)) if board else None
+        if not snap or snap["status"] == "cancelled":
+            await interaction.response.send_message("This game is no longer active.", ephemeral=True)
+            return
+        if not can_host(interaction, snap):
+            await interaction.response.send_message("Only the host or a mod can edit the notes.", ephemeral=True)
+            return
+        await interaction.response.send_modal(NotesModal(self, board_id, snap.get("notes") or ""))
+
+    async def set_notes(self, interaction: discord.Interaction, board_id: str, text: str):
+        """Shared by /fireball notes and the Edit notes pop-up: save, then edit the notes message in place."""
+        text = text.strip()[:NOTES_MAX_LENGTH]
+        async with self.store.lock:
+            board = self.store.data["boards"].get(board_id)
+            if not board:
+                await interaction.response.send_message("This game is no longer active.", ephemeral=True)
                 return
-        except discord.HTTPException:
-            pass
-        await interaction.response.send_message(content)
+            if not can_host(interaction, board):
+                await interaction.response.send_message("Only the host or a mod can edit the notes.", ephemeral=True)
+                return
+            if not text:
+                await interaction.response.send_message("Notes can't be blank.", ephemeral=True)
+                return
+            board["notes"] = text
+            self.store.save()
+            snap = json.loads(json.dumps(board))
+        content = notes_text(snap, interaction.user.display_name)
+        ch = await self._channel(snap)
+        if snap.get("notes_message_id") and ch is not None:
+            try:
+                # Re-attaching the view also gives notes posted before the button existed an Edit button.
+                await ch.get_partial_message(int(snap["notes_message_id"])).edit(
+                    content=content, view=notes_view(board_id))
+                await interaction.response.send_message("✅ Notes updated.", ephemeral=True)
+                return
+            except discord.HTTPException:
+                pass
+        # The original notes message is gone: post a fresh one and track that instead.
+        await interaction.response.send_message("✅ Notes updated.", ephemeral=True)
+        if ch is not None:
+            msg = await ch.send(content, view=notes_view(board_id))
+            async with self.store.lock:
+                b = self.store.data["boards"].get(board_id)
+                if b:
+                    b["notes_message_id"] = str(msg.id)
+                    self.store.save()
 
     async def _find_board(self, interaction: discord.Interaction, statuses: tuple[str, ...]) -> dict | None:
         async with self.store.lock:
