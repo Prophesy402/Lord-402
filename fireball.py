@@ -64,6 +64,7 @@ SAT_PREF_DELAY = 30           # seconds between the satellite filling and the sh
 SAT_DELAY = 5                 # seconds after the 7th digit before the satellite opens (last chance for others)
 SAT_CALL_RE = re.compile(r"^x(\d{1,2})$", re.IGNORECASE)   # typed satellite call, e.g. "X2"
 SIP_WORDS = {"sip", "sipped"}                               # "I've sent the host my tickets"
+REMIND_COOLDOWN = 60                                        # seconds between 🔔 Remind sips presses
 MIN_ROUNDS, MAX_ROUNDS = 3, 12
 SHUFFLE_DELAY = 2.5           # seconds between shuffle rounds
 FIRE_DELAY = 2.2              # seconds between finale edits (text fallback only)
@@ -533,6 +534,21 @@ def decide_sip(board: dict, user_id: str, approve: bool) -> dict | None:
     return s
 
 
+def sip_reminder_targets(board: dict) -> dict[str, int]:
+    """user_id -> tickets still unconfirmed, for everyone who hasn't sipped, was denied, or owes more.
+    People already waiting on the host are left out; it's the host's move, not theirs."""
+    sips = board.get("sips", {})
+    due: dict[str, int] = {}
+    for uid in dict.fromkeys(e["user_id"] for e in board["ledger"]):
+        amount, s = owed(board, uid), sips.get(uid)
+        if s and s["status"] == "pending":
+            continue
+        short_by = amount - s["amount"] if s and s["status"] == "confirmed" else amount
+        if short_by > 0:
+            due[uid] = short_by
+    return due
+
+
 def sip_lines(board: dict) -> str:
     """One line per player for the board embed: confirmed / waiting on host / denied / not sipped yet."""
     sips = board.get("sips", {})
@@ -732,7 +748,7 @@ def sat_embed(board: dict, cfg: dict) -> discord.Embed:
     return emb
 
 
-class BoardButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fb:(?P<board>[0-9a-f]+):(?P<action>d\d|yolo|odds|evens|close)"):
+class BoardButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fb:(?P<board>[0-9a-f]+):(?P<action>d\d|yolo|odds|evens|close|sip|remind)"):
     def __init__(self, board_id: str, action: str, label: str = "?", style=discord.ButtonStyle.secondary,
                  disabled: bool = False, row: int | None = None):
         super().__init__(discord.ui.Button(
@@ -829,6 +845,9 @@ def board_view(board: dict) -> discord.ui.View:
     view.add_item(BoardButton(board["id"], "evens", "Evens", discord.ButtonStyle.secondary, not live, row=2))
     closable = board["status"] in ("open", "satellite")
     view.add_item(BoardButton(board["id"], "close", "Close", discord.ButtonStyle.danger, not closable, row=2))
+    no_sips = board["status"] == "cancelled" or not board["ledger"]
+    view.add_item(BoardButton(board["id"], "sip", "💸 Sip", discord.ButtonStyle.success, no_sips, row=3))
+    view.add_item(BoardButton(board["id"], "remind", "🔔 Remind sips", discord.ButtonStyle.secondary, no_sips, row=3))
     return view
 
 
@@ -1093,6 +1112,12 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
     # ---- button handlers -------------------------------------------------
 
     async def on_board_click(self, interaction: discord.Interaction, board_id: str, action: str):
+        if action == "sip":
+            await self._board_sip(interaction, board_id)
+            return
+        if action == "remind":
+            await self._remind_sips(interaction, board_id)
+            return
         user = interaction.user
         opened_sat = False
         reply = ""
@@ -1228,33 +1253,28 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             if result["filled"]:
                 asyncio.create_task(self._fill_countdown(board_id))
 
-    async def _handle_sip(self, message: discord.Message):
-        """Player typed "sip": record it and send the host a Confirm / Deny request in their DMs."""
-        cid, uid = str(message.channel.id), str(message.author.id)
+    async def _submit_sip(self, board_id: str, member, channel, jump_url: str) -> str | None:
+        """
+        Record a sip and send the host a Confirm / Deny request (DM, or the thread if their DMs
+        are closed). Returns the private note for the player, or None if they have nothing to sip.
+        """
+        uid = str(member.id)
         async with self.store.lock:
-            found = sorted(
-                (b for b in self.store.data["boards"].values()
-                 if b["status"] != "cancelled" and cid in (b["channel_id"], str(b["sat"].get("thread_id")))),
-                key=lambda b: b["created_at"])
-            if not found:
-                return
-            board = found[-1]
-            res = request_sip(board, uid, message.author.display_name, cid)
+            board = self.store.data["boards"].get(board_id)
+            if not board or board["status"] == "cancelled":
+                return None
+            res = request_sip(board, uid, member.display_name, str(channel.id))
             if res is None:
-                return              # nothing on this board, nothing to sip
+                return None
             if res["ok"]:
                 self.store.save()
             snap = json.loads(json.dumps(board))
         if not res["ok"]:
-            try:
-                await message.reply(res["msg"], mention_author=False)
-            except discord.HTTPException:
-                pass
-            return
+            return res["msg"]
 
-        request = (f"💸 **{esc(message.author.display_name)}** (<@{uid}>) says they sipped "
+        request = (f"💸 **{esc(member.display_name)}** (<@{uid}>) says they sipped "
                    f"**{fmt_num(res['amount'])}** ticket(s) for 🔥 Fireball {esc(snap.get('code') or '')} "
-                   f"({draw_title(snap)}). Did you get it?\n{message.jump_url}")
+                   f"({draw_title(snap)}). Did you get it?\n{jump_url}")
         sent_dm = False
         try:
             host = self.bot.get_user(int(snap["host_id"])) or await self.bot.fetch_user(int(snap["host_id"]))
@@ -1263,17 +1283,75 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         except (discord.HTTPException, ValueError):
             # Host has DMs closed: put the buttons in the thread instead (only the host or an admin can press them).
             try:
-                await message.channel.send(f"<@{snap['host_id']}> {request}", view=sip_view(snap["id"], uid))
+                await channel.send(f"<@{snap['host_id']}> {request}", view=sip_view(snap["id"], uid))
             except discord.HTTPException:
                 log.exception("Couldn't send sip request for board %s", snap["id"])
+        await self._refresh(snap["id"])
+        return (f"📨 Your sip for **{fmt_num(res['amount'])}** ticket(s) on Fireball {esc(snap.get('code') or '')} "
+                f"was sent to the host to confirm" + ("." if sent_dm else " (in the thread, their DMs are closed)."))
+
+    def _board_for_channel(self, cid: str) -> dict | None:
+        found = sorted(
+            (b for b in self.store.data["boards"].values()
+             if b["status"] != "cancelled" and cid in (b["channel_id"], str(b["sat"].get("thread_id")))),
+            key=lambda b: b["created_at"])
+        return found[-1] if found else None
+
+    async def _handle_sip(self, message: discord.Message):
+        """Typed "sip". No reply in the thread (too much filler): a 📨 reaction, and the note goes by DM."""
+        async with self.store.lock:
+            board = self._board_for_channel(str(message.channel.id))
+        if not board:
+            return
+        note = await self._submit_sip(board["id"], message.author, message.channel, message.jump_url)
+        if note is None:
+            return
         try:
-            await message.reply(
-                f"📨 Sip for **{fmt_num(res['amount'])}** ticket(s) sent to the host"
-                + (" to confirm." if sent_dm else " here to confirm (their DMs are closed)."),
-                mention_author=False)
+            await message.add_reaction("📨" if note.startswith("📨") else "👀")
         except discord.HTTPException:
             pass
-        await self._refresh(snap["id"])
+        try:
+            await message.author.send(note)
+        except discord.HTTPException:
+            pass
+
+    async def _board_sip(self, interaction: discord.Interaction, board_id: str):
+        """💸 Sip button: same as typing sip, but the answer is only visible to the player."""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        note = await self._submit_sip(board_id, interaction.user, interaction.channel, interaction.channel.jump_url)
+        await interaction.followup.send(note or "You don't have any digits or satellite spots on this board.",
+                                        ephemeral=True)
+
+    async def _remind_sips(self, interaction: discord.Interaction, board_id: str):
+        """🔔 Remind sips button (host/admin): one message pinging everyone who still needs to sip."""
+        async with self.store.lock:
+            board = self.store.data["boards"].get(board_id)
+            if not board:
+                await interaction.response.send_message("This board is no longer active.", ephemeral=True)
+                return
+            if str(interaction.user.id) != board["host_id"] and not is_admin(interaction):
+                await interaction.response.send_message("Only the host or an admin can send sip reminders.", ephemeral=True)
+                return
+            now = datetime.now(timezone.utc)
+            last = board.get("last_remind_at")
+            if last and now - datetime.fromisoformat(last) < timedelta(seconds=REMIND_COOLDOWN):
+                left = REMIND_COOLDOWN - int((now - datetime.fromisoformat(last)).total_seconds())
+                await interaction.response.send_message(f"You just sent one. Try again in {left}s.", ephemeral=True)
+                return
+            due = sip_reminder_targets(board)
+            waiting = sum(1 for s in board.get("sips", {}).values() if s["status"] == "pending")
+            if due:
+                board["last_remind_at"] = now.isoformat()
+                self.store.save()
+            snap = json.loads(json.dumps(board))
+        pending_note = f" **{waiting}** sip(s) are waiting on you to confirm." if waiting else ""
+        if not due:
+            await interaction.response.send_message("Nobody needs a reminder." + pending_note, ephemeral=True)
+            return
+        who = ", ".join(f"<@{uid}> (**{fmt_num(n)}**)" for uid, n in due.items())
+        await interaction.response.send_message(f"🔔 Reminder sent to {len(due)} player(s).{pending_note}", ephemeral=True)
+        await self._say(snap, f"🔔 **Sip reminder** for Fireball {esc(snap.get('code') or '')}: {who}\n"
+                              f"Send the host your tickets, then tap **💸 Sip** on the board (or type `sip`).")
 
     async def on_sip_decision(self, interaction: discord.Interaction, board_id: str, user_id: str, approve: bool):
         async with self.store.lock:
@@ -1292,17 +1370,23 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             snap = json.loads(json.dumps(board))
         verdict = "✅ **Confirmed**" if approve else "❌ **Denied**"
         await interaction.response.edit_message(content=f"{interaction.message.content}\n\n{verdict}", view=None)
+        game = f"Fireball {esc(snap.get('code') or '')}"
         if approve:
-            text = f"✅ <@{snap['host_id']}> confirmed <@{user_id}>'s sip (**{fmt_num(s['amount'])}** ticket(s))."
+            note = f"✅ The host confirmed your sip (**{fmt_num(s['amount'])}** ticket(s)) on {game}."
         else:
-            text = (f"❌ <@{snap['host_id']}> denied <@{user_id}>'s sip (**{fmt_num(s['amount'])}** ticket(s)). "
-                    f"Sort it out with the host, then type `sip` again.")
-        ch = await self._chan_by_id(s.get("channel_id")) or await self._channel(snap)
-        if ch is not None:
-            try:
-                await self._send(ch, text)
-            except discord.HTTPException:
-                pass
+            note = (f"❌ The host denied your sip (**{fmt_num(s['amount'])}** ticket(s)) on {game}. "
+                    f"Sort it out with them, then sip again.")
+        # Tell the player privately; the board's Sips list shows everyone the tally.
+        try:
+            player = self.bot.get_user(int(user_id)) or await self.bot.fetch_user(int(user_id))
+            await player.send(note)
+        except (discord.HTTPException, ValueError):
+            ch = await self._chan_by_id(s.get("channel_id")) or await self._channel(snap)
+            if ch is not None:
+                try:
+                    await self._send(ch, f"<@{user_id}> {note}")
+                except discord.HTTPException:
+                    pass
         await self._refresh(board_id)
 
     async def on_pref_pick(self, interaction: discord.Interaction, board_id: str, digit: int | None):

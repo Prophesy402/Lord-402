@@ -84,8 +84,9 @@ Played on the **Illinois Pick 3 Fireball** digit (0–9).
   (best pick still free from their preferences, otherwise random).
 
 **SIP**
-• Sent the host your tickets? Type `sip` in the thread. The host gets a
-  DM to ✅ confirm or ❌ deny, and the board shows who's sipped.
+• Sent the host your tickets? Tap **💸 Sip** on the board (or type `sip`).
+  The host gets a DM to ✅ confirm or ❌ deny; you hear back privately.
+• Host: **🔔 Remind sips** pings everyone who still owes.
 
 **THE RESULT**
 • Minutes after the draw the bot posts the result from
@@ -93,7 +94,7 @@ Played on the **Illinois Pick 3 Fireball** digit (0–9).
 • Winner takes the prize. In **90% BB** games the post shows the buyback math.
 
 **HOST / ADMIN TOOLS**
-• `/fireball result` — re-check the site, or `fireball:<digit>` to enter it by hand
+• `/fireball result` — re-check the site, or enter the digit by hand
 • `/fireball notes` — update the host notes
 • `/fireball-cancel` — **mods only**: cancel the board; **every claim is void**
 • `/fireball config lock_minutes:` — admins: change the lock time
