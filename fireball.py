@@ -626,6 +626,39 @@ def force_sip(board: dict, user_id: str) -> int:
     return amount
 
 
+PAY_INFO_MAX = 200
+
+
+def get_pay(data: dict, user_id) -> str | None:
+    """Where this player wants 💰 sent (Venmo, Cash App, a link...), saved with /payinfo set."""
+    return (data.get("pay", {}).get(str(user_id)) or {}).get("info")
+
+
+def set_pay(data: dict, user_id, info: str | None) -> None:
+    pay = data.setdefault("pay", {})
+    if info:
+        pay[str(user_id)] = {"info": info, "updated_at": datetime.now(timezone.utc).isoformat()}
+    else:
+        pay.pop(str(user_id), None)
+
+
+def pay_line(info: str | None) -> str:
+    if info:
+        return f"💰 **Send to:** {discord.utils.escape_mentions(info)}"
+    return "💰 *The host hasn't saved their pay info yet (host: use `/payinfo set`).*"
+
+
+def has_sipped(board: dict, user_id: str) -> bool:
+    s = board.get("sips", {}).get(str(user_id))
+    return bool(s and s["status"] == "confirmed" and s["amount"] >= owed(board, user_id))
+
+
+def buyback_owed(board: dict, user_id: str) -> float:
+    """90% of every ticket, less one digit's cost if the winner never sipped (same math as the result post)."""
+    bb = ticket_total(board) * 0.9
+    return bb if has_sipped(board, user_id) else max(0, bb - board["digit_cost"])
+
+
 def lock_board(data: dict, board: dict) -> str:
     """Close claiming (Close button or draw time). Returns a short note for the channel."""
     note = ""
@@ -921,8 +954,10 @@ def sip_view(board_id: str, user_id: str) -> discord.ui.View:
 NOTES_MAX_LENGTH = 1800
 
 
-def notes_text(board: dict, fallback_author: str) -> str:
-    return f"📋 **Host notes ({esc(board.get('notes_author') or fallback_author)}):** {board.get('notes') or ''}"
+def notes_text(board: dict, fallback_author: str, pay: str | None = None) -> str:
+    """The host notes, with the host's saved pay info added underneath so players know where to send 💰."""
+    return (f"📋 **Host notes ({esc(board.get('notes_author') or fallback_author)}):** {board.get('notes') or ''}\n"
+            f"{pay_line(pay)}")
 
 
 class NotesButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fn:(?P<board>[0-9a-f]+)"):
@@ -961,6 +996,32 @@ class NotesModal(discord.ui.Modal, title="Edit host notes"):
 
     async def on_submit(self, interaction: discord.Interaction):
         await self.cog.set_notes(interaction, self.board_id, self.notes_input.value)
+
+
+class BBButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fbb:(?P<board>[0-9a-f]+)"):
+    """💰 Take 90% BB on the result post of a buyback game. Only the winner can press it."""
+
+    def __init__(self, board_id: str, disabled: bool = False):
+        super().__init__(discord.ui.Button(label="Take 90% BB", emoji="💰", style=discord.ButtonStyle.success,
+                                           custom_id=f"fbb:{board_id}", disabled=disabled))
+        self.board_id = board_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(match["board"])
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = _active_cog
+        if cog is None:
+            await interaction.response.send_message("Fireball isn't loaded right now.", ephemeral=True)
+            return
+        await cog.on_bb_click(interaction, self.board_id)
+
+
+def bb_view(board_id: str, disabled: bool = False) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(BBButton(board_id, disabled))
+    return view
 
 
 def thread_name(tag: str, code: str | None) -> str:
@@ -1113,7 +1174,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
     async def cog_load(self):
         global _active_cog
         _active_cog = self
-        self.bot.add_dynamic_items(BoardButton, SatButton, SipButton, NotesButton)
+        self.bot.add_dynamic_items(BoardButton, SatButton, SipButton, NotesButton, BBButton)
         self.session = aiohttp.ClientSession()
         self.tick.start()
 
@@ -1523,9 +1584,94 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             await interaction.response.send_message("Nobody needs a reminder." + pending_note, ephemeral=True)
             return
         who = ", ".join(f"<@{uid}> (**{fmt_num(n)}**)" for uid, n in due.items())
+        async with self.store.lock:
+            host_pay = get_pay(self.store.data, snap["host_id"])
         await interaction.response.send_message(f"🔔 Reminder sent to {len(due)} player(s).{pending_note}", ephemeral=True)
         await self._say(snap, f"🔔 **Sip reminder** for Fireball {esc(snap.get('code') or '')}: {who}\n"
-                              f"Send the host your tickets, then tap **💸 Sip** on the board (or type `sip`).")
+                              f"Send the host your tickets, then tap **💸 Sip** on the board (or type `sip`).\n"
+                              f"{pay_line(host_pay)}")
+
+    async def on_bb_click(self, interaction: discord.Interaction, board_id: str):
+        """Winner takes the 90% buyback: the host gets a DM with the winner's pay info and what they owe."""
+        async with self.store.lock:
+            board = self.store.data["boards"].get(board_id)
+            if not board or board["status"] != "settled" or not board.get("result"):
+                await interaction.response.send_message("This game isn't settled.", ephemeral=True)
+                return
+            holder = board["digits"][str(board["result"]["fireball"])]
+            uid = str(interaction.user.id)
+            if not holder or holder["user_id"] != uid:
+                await interaction.response.send_message("Only the winner can take the buyback.", ephemeral=True)
+                return
+            if board.get("bb_taken"):
+                await interaction.response.send_message("You already took the buyback. The host has your info.",
+                                                        ephemeral=True)
+                return
+            pay = get_pay(self.store.data, uid)
+            if not pay:
+                await interaction.response.send_message(
+                    "Save where you want your 💰 sent first with `/payinfo set`, then tap **Take 90% BB** again.",
+                    ephemeral=True)
+                return
+            amount, sipped = buyback_owed(board, uid), has_sipped(board, uid)
+            board["bb_taken"] = True
+            self.store.save()
+            snap = json.loads(json.dumps(board))
+        request = (f"💰 **{esc(interaction.user.display_name)}** (<@{uid}>) took the **90% BB** on "
+                   f"🔥 Fireball {esc(snap.get('code') or '')} ({draw_title(snap)}).\n"
+                   f"Send them **{fmt_num(amount)}**"
+                   + (".\n" if sipped else f" (they never sipped, so one digit's cost, {fmt_num(snap['digit_cost'])}, is taken off).\n")
+                   + pay_line(pay).replace("Send to:", "Send their 💰 to:"))
+        await interaction.response.send_message(
+            f"✅ The host has your pay info and owes you **{fmt_num(amount)}**.", ephemeral=True)
+        try:
+            await interaction.message.edit(view=bb_view(board_id, disabled=True))
+        except discord.HTTPException:
+            pass
+        try:
+            host = self.bot.get_user(int(snap["host_id"])) or await self.bot.fetch_user(int(snap["host_id"]))
+            await host.send(request)
+            dm_note = "The host has been sent their pay info."
+        except (discord.HTTPException, ValueError):
+            await self._say(snap, f"<@{snap['host_id']}> {request}")
+            dm_note = ""
+        await self._say(snap, f"💰 <@{uid}> took the **90% BB**. {dm_note}".strip(),
+                        allowed_mentions=discord.AllowedMentions.none())
+
+    async def show_pay(self, interaction: discord.Interaction, user):
+        target = user or interaction.user
+        async with self.store.lock:
+            info = get_pay(self.store.data, target.id)
+        if info:
+            await interaction.response.send_message(
+                f"💰 **{esc(target.display_name)}** gets paid at: {discord.utils.escape_mentions(info)}", ephemeral=True)
+        elif target.id == interaction.user.id:
+            await interaction.response.send_message("You haven't saved any pay info. Use `/payinfo set`.", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"{esc(target.display_name)} hasn't saved any pay info.",
+                                                    ephemeral=True)
+
+    async def save_pay(self, interaction: discord.Interaction, info: str | None):
+        info = (info or "").strip()[:PAY_INFO_MAX] or None
+        uid = str(interaction.user.id)
+        async with self.store.lock:
+            set_pay(self.store.data, uid, info)
+            self.store.save()
+            mine = [json.loads(json.dumps(b)) for b in self.store.data["boards"].values()
+                    if b["host_id"] == uid and b["status"] not in ("settled", "cancelled") and b.get("notes_message_id")]
+        await interaction.response.send_message(
+            (f"✅ Saved. Players will see: {pay_line(info)}" if info else "🗑️ Your pay info is cleared.")
+            + (f"\nUpdated the notes on {len(mine)} open game(s)." if mine else ""), ephemeral=True)
+        # Games you're hosting right now pick up the change straight away.
+        for b in mine:
+            ch = await self._channel(b)
+            if ch is None:
+                continue
+            try:
+                await ch.get_partial_message(int(b["notes_message_id"])).edit(
+                    content=notes_text(b, b["host_name"], info), view=notes_view(b["id"]))
+            except discord.HTTPException:
+                pass
 
     async def _panel_board(self, interaction: discord.Interaction, board_id: str) -> dict | None:
         """Snapshot of the board if the presser may use host controls on it; otherwise answers them and returns None."""
@@ -2018,7 +2164,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         emb.add_field(name="Link", value=RESULTS_URL, inline=False)
         emb.set_footer(text=f"{date.fromisoformat(snap['draw_date']).strftime('%A %b %d, %Y').replace(' 0', ' ')} ({snap['draw'].title()})")
         text = result_text(snap, holder, fireball)
-        msg = await self._say(snap, text, embed=emb)
+        extra = {"view": bb_view(board_id)} if holder and snap.get("bb") else {}
+        msg = await self._say(snap, text, embed=emb, **extra)
         async with self.store.lock:
             b = self.store.data["boards"].get(board_id)
             if b and msg:
@@ -2098,7 +2245,10 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         board["parent_channel_id"] = str(interaction.channel_id)
         board["channel_id"] = str(thread.id)
         board["announce_msg_id"] = str(announcement.id)
-        notes_msg = await thread.send(notes_text(board, interaction.user.display_name), view=notes_view(board["id"]))
+        async with self.store.lock:
+            host_pay = get_pay(self.store.data, interaction.user.id)
+        notes_msg = await thread.send(notes_text(board, interaction.user.display_name, host_pay),
+                                      view=notes_view(board["id"]))
         board["notes_message_id"] = str(notes_msg.id)
         board_msg = await thread.send(embed=board_embed(board, cfg), view=board_view(board))
         board["board_msg_id"] = str(board_msg.id)
@@ -2106,6 +2256,10 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             self.store.data["boards"][board["id"]] = board
             self.store.save()
         await interaction.followup.send(f"Fireball thread created: {thread.mention}")
+        if not host_pay:
+            await interaction.followup.send(
+                "💰 Tip: save where players should send 💰 with `/payinfo set` and it'll show in your notes "
+                "automatically, on this game and every game after.", ephemeral=True)
 
     @app_commands.command(name="notes", description="Host: change the notes on this Fireball game")
     @app_commands.describe(text="The new notes")
@@ -2146,7 +2300,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             board["notes"] = text
             self.store.save()
             snap = json.loads(json.dumps(board))
-        content = notes_text(snap, interaction.user.display_name)
+            host_pay = get_pay(self.store.data, snap["host_id"])
+        content = notes_text(snap, interaction.user.display_name, host_pay)
         ch = await self._channel(snap)
         if snap.get("notes_message_id") and ch is not None:
             try:
@@ -2261,6 +2416,37 @@ async def fireball_cancel(interaction: discord.Interaction):
     await _active_cog.cancel(interaction)
 
 
+payinfo_group = app_commands.Group(name="payinfo", description="Where you want 💰 sent (shows in your host notes)",
+                                   guild_only=True)
+
+
+@payinfo_group.command(name="set", description="Save where people should send you 💰 (Venmo, Cash App, a link...)")
+@app_commands.describe(info="e.g. Venmo @yourname, Cash App $yourname, or a payment link")
+async def payinfo_set(interaction: discord.Interaction, info: app_commands.Range[str, 1, PAY_INFO_MAX]):
+    if _active_cog is None:
+        await interaction.response.send_message("Fireball isn't loaded right now.", ephemeral=True)
+        return
+    await _active_cog.save_pay(interaction, info)
+
+
+@payinfo_group.command(name="show", description="See where someone gets paid (just you see the answer)")
+@app_commands.describe(user="Who to look up (default: you)")
+async def payinfo_show(interaction: discord.Interaction, user: discord.Member | None = None):
+    if _active_cog is None:
+        await interaction.response.send_message("Fireball isn't loaded right now.", ephemeral=True)
+        return
+    await _active_cog.show_pay(interaction, user)
+
+
+@payinfo_group.command(name="clear", description="Delete your saved pay info")
+async def payinfo_clear(interaction: discord.Interaction):
+    if _active_cog is None:
+        await interaction.response.send_message("Fireball isn't loaded right now.", ephemeral=True)
+        return
+    await _active_cog.save_pay(interaction, None)
+
+
 async def setup(bot: commands.Bot):
     await bot.add_cog(FireballCog(bot))
     bot.tree.add_command(fireball_cancel, override=True)
+    bot.tree.add_command(payinfo_group, override=True)

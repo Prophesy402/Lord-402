@@ -63,7 +63,7 @@ Played on the **Illinois Pick 3 Fireball** digit (0–9).
 1. Go to a normal text channel (not a thread) and run `/fireball start`
    • `code` — short game code, e.g. FB18
    • `prize` — each digit costs 1/10 of it (500 → 50 a digit)
-   • `image` + `notes` — picture and anything it doesn't show (required)
+   • `image` + `notes` — picture and anything else (required)
    • `draw` — Midday (12:40 CT) / Evening (9:22 CT), blank = next
    • `bb` — on for **90% buyback** games
 2. The bot opens a thread with the digit board.
@@ -77,25 +77,25 @@ Played on the **Illinois Pick 3 Fireball** digit (0–9).
 **THE SATELLITE**
 • Once **7 digits** are claimed, there's a **5-second** last call, then
   the remaining digits go to a **10-spot satellite** in its own thread.
-• Tap the **X1** button to take a spot (typing X1 doesn't count).
-  Tap **⭐ Preferences** to rank which open digits you want.
+• Tap **X1** to take a spot, **⭐ Preferences** to rank the open digits.
 • When it fills, you get **30 seconds** to set preferences, then the
   ducks get lit on fire 🔥. The **last 3 still burning** each win a digit
   (best pick still free from their preferences, otherwise random).
 
-**SIP**
-• Sent the host your tickets? Tap **💸 Sip** on the board (or type `sip`).
-  The host gets a DM to ✅ confirm or ❌ deny; you hear back privately.
+**PAY + SIP**
+• Save where you get paid once: `/payinfo set`. Host notes show it
+  automatically, so players know where to send 💰.
+• Sent the host your 💰? Tap **💸 Sip** (or type `sip`). The host gets a
+  DM to ✅ confirm or ❌ deny; you hear back privately.
 
 **THE RESULT**
-• Minutes after the draw the bot posts the result from
-  illinoislottery.com and tags whoever holds the Fireball digit.
-• Winner takes the prize (**90% BB** games show the buyback math).
+• Minutes after the draw the bot posts the result and tags the winner.
+• **90% BB** games: the winner taps **💰 Take 90% BB** and the host gets
+  a DM with their pay info and what they're owed.
 
 **HOST / ADMIN TOOLS**
 • **Host Controls** (host + mods): release a spot someone didn't mean to
   call, force/remind sips, expected sips, close the board
 • **Admin Controls** (mods): all of that plus cancel the board
 • `/fireball result` — re-check the site, or enter the digit by hand
-• `/fireball notes` — update the host notes
 ```
