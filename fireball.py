@@ -2178,17 +2178,19 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
 
     @app_commands.command(name="start", description="Open a Fireball game for the next Pick 3 draw")
     @app_commands.describe(
-        code="Short game code, e.g. FB18",
-        prize="Prize amount. Each of the 10 digits is worth a tenth of it (500 -> 50 a digit)",
-        image="Image to post with the announcement (required)",
-        notes="Notes posted in the thread, e.g. anything the picture doesn't show (required)",
+        race_name="Name of this game, e.g. RR15",
+        value="What it's worth. Each of the 10 digits costs a tenth of it (500 -> 50 a digit)",
+        image="Picture to post with the announcement",
+        payment_link="Where to send 💰 (leave blank to use your saved /payinfo)",
         draw="Midday or evening (default: the next one still open)",
         bb="90% BB (buyback): the result post shows the winner's buyback, 90% of the total (default off)")
     @app_commands.choices(draw=[app_commands.Choice(name="Midday (12:40 PM CT)", value="midday"),
                                 app_commands.Choice(name="Evening (9:22 PM CT)", value="evening")])
-    async def start(self, interaction: discord.Interaction, code: str,
-                    prize: app_commands.Range[int, 1, 1000000], image: discord.Attachment, notes: str,
+    async def start(self, interaction: discord.Interaction, race_name: str,
+                    value: app_commands.Range[int, 1, 1000000], image: discord.Attachment,
+                    payment_link: str | None = None,
                     draw: app_commands.Choice[str] | None = None, bb: bool = False):
+        code, prize, notes = race_name, value, (payment_link or "").strip()
         if not isinstance(interaction.channel, discord.TextChannel):
             await interaction.response.send_message(
                 "Run `/fireball start` from a regular text channel. I'll create a thread there for the game.",
@@ -2198,13 +2200,9 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             await interaction.response.send_message(
                 "That attachment doesn't look like an image. Please attach a picture.", ephemeral=True)
             return
-        if not notes.strip():
-            await interaction.response.send_message(
-                "Notes can't be blank. Add a line about anything the picture doesn't show.", ephemeral=True)
-            return
         code = code.strip()[:40]
         if not code:
-            await interaction.response.send_message("Give the game a short code, e.g. FB18.", ephemeral=True)
+            await interaction.response.send_message("Give the game a name, e.g. RR15.", ephemeral=True)
             return
 
         async with self.store.lock:
@@ -2247,6 +2245,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         board["announce_msg_id"] = str(announcement.id)
         async with self.store.lock:
             host_pay = get_pay(self.store.data, interaction.user.id)
+        if not board["notes"]:
+            board["notes"] = host_pay or "(no payment link yet)"
         notes_msg = await thread.send(notes_text(board, interaction.user.display_name, host_pay),
                                       view=notes_view(board["id"]))
         board["notes_message_id"] = str(notes_msg.id)
@@ -2258,8 +2258,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         await interaction.followup.send(f"Fireball thread created: {thread.mention}")
         if not host_pay:
             await interaction.followup.send(
-                "💰 Tip: save where players should send 💰 with `/payinfo set` and it'll show in your notes "
-                "automatically, on this game and every game after.", ephemeral=True)
+                "💰 Tip: save your payment link once with `/payinfo set` and you can skip typing it "
+                "on every game.", ephemeral=True)
 
     @app_commands.command(name="notes", description="Host: change the notes on this Fireball game")
     @app_commands.describe(text="The new notes")

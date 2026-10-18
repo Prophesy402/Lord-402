@@ -60,19 +60,20 @@ Payments are handled **outside** the bot. Don't sip until you've paid.
 Played on the **Illinois Pick 3 Fireball** digit (0–9).
 
 **HOSTS — opening a board**
-1. Go to a normal text channel (not a thread) and run `/fireball start`
-   • `code` — short game code, e.g. FB18
-   • `prize` — each digit costs 1/10 of it (500 → 50 a digit)
-   • `image` + `notes` — picture and anything else (required)
-   • `draw` — Midday (12:40 CT) / Evening (9:22 CT), blank = next
+1. In a normal text channel (not a thread) run `/fireball start`
+   • `race_name` — e.g. RR15
+   • `value` — each digit costs 1/10 of it (500 → 50 a digit)
+   • `image` — picture for the announcement
+   • `payment_link` — where to send 💰 (blank = your saved `/payinfo`)
+   • `draw` — Midday / Evening (blank = next one)
    • `bb` — on for **90% buyback** games
 2. The bot opens a thread with the digit board.
 3. Claims lock **10 min before the draw** (or Host Controls → Close).
 
 **PLAYERS — claiming digits**
 • Tap a digit **0–9** to claim it.
-• 🎲 **YOLO** = random open digit. **Odds** / **Evens** = grab all of them.
-• 🏁 **Close** = take every open digit. Fill all 10 and there's no satellite.
+• 🎲 **YOLO** = random digit. **Odds** / **Evens** = all of them.
+• 🏁 **Close** = take every open digit. All 10 filled = no satellite.
 
 **THE SATELLITE**
 • Once **7 digits** are claimed, there's a **5-second** last call, then
