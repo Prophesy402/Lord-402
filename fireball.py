@@ -541,6 +541,12 @@ def sip_reminder_targets(board: dict) -> dict[str, int]:
     return due
 
 
+def sip_mark(board: dict, user_id: str) -> str:
+    """The 💰 that sits next to a player's name once the host has confirmed their sip ('' until then)."""
+    s = board.get("sips", {}).get(str(user_id))
+    return f" {TALLY_EMOJI}" if s and s["status"] == "confirmed" else ""
+
+
 def sip_lines(board: dict) -> str:
     """One line per player for the board embed: confirmed / waiting on host / denied / not sipped yet."""
     sips = board.get("sips", {})
@@ -676,6 +682,15 @@ def lock_board(data: dict, board: dict) -> str:
             f"The satellite didn't fill ({spots_taken}/{SAT_SPOTS}), so it was cancelled and "
             f"those {TALLY_EMOJI}**{returned}** of satellite claims are void. Those digits stay unclaimed."
         )
+    if len(claimed_digits(board)) < 10:
+        # Fill or kill: a board that isn't full at the deadline is dead. Nothing is owed, nobody can win.
+        open_count = 10 - len(claimed_digits(board))
+        returned = void_charges(board)
+        board["sat_at"] = None
+        board["status"] = "cancelled"
+        board["killed"] = True
+        return (f"**FILL OR KILL:** only {10 - open_count}/10 digits were claimed, so this game is **killed**. "
+                f"No winner this draw and every claim ({TALLY_EMOJI}**{returned}**) is void; nobody owes anything.")
     board["status"] = "locked"
     return note
 
@@ -818,7 +833,7 @@ def board_embed(board: dict, cfg: dict) -> discord.Embed:
         c = board["digits"][str(d)]
         if c:
             tag = " 🦆" if c.get("via") == "satellite" else ""
-            lines.append(f"`{d}`  **{esc(c['name'])}**{tag}")
+            lines.append(f"`{d}`  **{esc(c['name'])}**{sip_mark(board, c['user_id'])}{tag}")
         elif status == "satellite":
             lines.append(f"`{d}`  🔒 *reserved for satellite winners*")
         else:
@@ -842,7 +857,8 @@ def board_embed(board: dict, cfg: dict) -> discord.Embed:
         "animating": "Satellite is full. The shuffle and the fire are underway...",
         "locked": f"Claims are closed. Draw at {ts(board['draw_at'], 't')}. Result posts automatically.",
         "settled": "Settled. See the result below.",
-        "cancelled": "Cancelled. Everything was returned.",
+        "cancelled": ("💀 Killed: the board didn't fill by the deadline. No winner; all claims void."
+                      if board.get("killed") else "Cancelled. Everything was returned."),
     }
     emb.add_field(name="Status", value=state_text_override or state_text.get(status, status), inline=False)
     if board["ledger"] and status != "cancelled":
@@ -858,7 +874,7 @@ def sat_embed(board: dict, cfg: dict) -> discord.Embed:
     taken = sum(1 for s in spots if s)
     reserved = ", ".join(str(d) for d in board["sat"]["reserved"]) or "none"
     roster = "\n".join(
-        f"**{n}\\)** " + (f"<@{sp['user_id']}>" if sp else "")
+        f"**{n}\\)** " + (f"<@{sp['user_id']}>{sip_mark(board, sp['user_id'])}" if sp else "")
         for n, sp in enumerate(spots, start=1))
     prefs = board["sat"].get("prefs") or {}
     pref_text = ""
@@ -1423,8 +1439,12 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         await self._refresh(board_id)
         await interaction.followup.send(reply, ephemeral=True)
         if closed_note is not None:
-            await self._say(snapshot, f"🔒 **Fireball board closed** by {esc(user.display_name)}. {closed_note}".strip())
-            await self._tag(snapshot, "CLOSED")
+            if snapshot["status"] == "cancelled":
+                await self._say(snapshot, f"💀 **Fireball board closed by {esc(user.display_name)} before it filled.** {closed_note}")
+                await self._tag(snapshot, "KILLED")
+            else:
+                await self._say(snapshot, f"🔒 **Fireball board closed** by {esc(user.display_name)}. {closed_note}".strip())
+                await self._tag(snapshot, "CLOSED")
             await self._retire_sat(snapshot)
         if filled:
             await self._say(snapshot, f"🏁 **{esc(user.display_name)} closed out the board!** All 10 digits are claimed, "
@@ -2108,8 +2128,12 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             self.store.save()
             snap = json.loads(json.dumps(board))
         await self._refresh(board_id)
-        await self._say(snap, f"🔒 **Fireball claims are closed** for the {snap['draw']} draw. {note}".strip())
-        await self._tag(snap, "CLOSED")
+        if snap["status"] == "cancelled":
+            await self._say(snap, f"💀 **Fireball {esc(snap.get('code') or '')} didn't fill by the deadline.** {note}")
+            await self._tag(snap, "KILLED")
+        else:
+            await self._say(snap, f"🔒 **Fireball claims are closed** for the {snap['draw']} draw. {note}".strip())
+            await self._tag(snap, "CLOSED")
         await self._retire_sat(snap)
 
     async def _maybe_fetch_result(self, board_id: str, now: datetime):
