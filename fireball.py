@@ -914,10 +914,84 @@ def board_embed(board: dict, cfg: dict) -> discord.Embed:
     emb.add_field(name="Status", value=state_text_override or state_text.get(status, status), inline=False)
     if board["ledger"] and status != "cancelled":
         emb.add_field(name=f"Sips (tap 💸 Sip once you've sent the host your {TALLY_EMOJI})", value=sip_lines(board), inline=False)
-    emb.set_footer(
-        text=f"Digit: {board['digit_cost']} · Satellite spot: {board['sat_cost']} (the open digits split 10 ways) · Host: {board['host_name']}"
-    )
+    emb.set_footer(text=board_footer(board))
     return emb
+
+
+def board_status_text(board: dict) -> str:
+    """The one-line status shown under the digits (shared by the embed and the panel layouts)."""
+    emb = board_embed(board, DEFAULT_CONFIG)
+    return next((f.value for f in emb.fields if f.name == "Status"), "")
+
+
+def board_footer(board: dict) -> str:
+    return f"Digit: {board['digit_cost']} · Satellite spot: {board['sat_cost']} (the open digits split 10 ways) · Host: {board['host_name']}"
+
+
+USE_PANEL_LAYOUT = hasattr(discord.ui, "LayoutView")   # discord.py 2.6+: components v2
+
+
+def board_panel(board: dict, cfg: dict):
+    """
+    The main board as one panel: open digits are buttons sitting in the numbered list,
+    claimed digits are text lines with the owner's name. Needs discord.py 2.6+;
+    board_message() falls back to the embed + button grid on older versions.
+    """
+    ui = discord.ui
+    th = theme(board)
+    status = board["status"]
+    live = status == "open"
+    color = th["colors"].get(status, th["colors"]["open"])
+    container = ui.Container(accent_color=discord.Color(color))
+    container.add_item(ui.TextDisplay(
+        f"## {th['board_title']}{(' ' + esc(board['code'])) if board.get('code') else ''} — {draw_title(board)}\n"
+        f"**Prize:** {esc(str(board['prize']))}  *(winner takes all)* · each digit is worth **{board['digit_cost']}**"
+        f"{' · **90% BB**' if board.get('bb') else ''}"))
+    container.add_item(ui.Separator())
+    for d in range(10):
+        c = board["digits"][str(d)]
+        if c:
+            tag = " 🦆" if c.get("via") == "satellite" else ""
+            container.add_item(ui.TextDisplay(f"**{d})** <@{c['user_id']}>{sip_mark(board, c['user_id'])}{tag}"))
+        elif status == "satellite":
+            container.add_item(ui.TextDisplay(f"**{d})** 🔒 *reserved for satellite winners*"))
+        else:
+            row = ui.ActionRow()
+            row.add_item(BoardButton(board["id"], f"d{d}", str(d), discord.ButtonStyle.primary, not live))
+            container.add_item(row)
+    container.add_item(ui.Separator())
+    text = f"**Status**\n{board_status_text(board)}"
+    if board["ledger"] and status != "cancelled":
+        text += f"\n\n**Sips** (tap 💸 Sip once you've sent the host your {TALLY_EMOJI})\n{sip_lines(board)}"
+    container.add_item(ui.TextDisplay(text))
+    container.add_item(ui.TextDisplay(f"-# {board_footer(board)}"))
+    row = ui.ActionRow()
+    row.add_item(BoardButton(board["id"], "yolo", "🎲 YOLO", discord.ButtonStyle.success, not live))
+    row.add_item(BoardButton(board["id"], "odds", "Odds", discord.ButtonStyle.secondary, not live))
+    row.add_item(BoardButton(board["id"], "evens", "Evens", discord.ButtonStyle.secondary, not live))
+    row.add_item(BoardButton(board["id"], "closeout", "🏁 Close", discord.ButtonStyle.danger, not live))
+    container.add_item(row)
+    row = ui.ActionRow()
+    no_sips = status == "cancelled" or not board["ledger"]
+    done = status == "cancelled"
+    row.add_item(BoardButton(board["id"], "sip", "💸 Sip", discord.ButtonStyle.success, no_sips))
+    row.add_item(BoardButton(board["id"], "host", "Host Controls", discord.ButtonStyle.primary, done))
+    row.add_item(BoardButton(board["id"], "admin", "Admin Controls", discord.ButtonStyle.primary, done))
+    container.add_item(row)
+    view = ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+
+def board_message(board: dict, cfg: dict) -> dict:
+    """kwargs for send()/edit() of the main board message, in whichever layout this discord.py supports."""
+    if USE_PANEL_LAYOUT:
+        try:
+            return {"content": None, "embed": None, "view": board_panel(board, cfg),
+                    "allowed_mentions": discord.AllowedMentions.none()}
+        except Exception:
+            log.exception("Panel layout failed for board %s; using the embed instead", board["id"])
+    return {"embed": board_embed(board, cfg), "view": board_view(board)}
 
 
 def sat_embed(board: dict, cfg: dict) -> discord.Embed:
@@ -1401,8 +1475,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 return
             try:
                 if board["board_msg_id"]:
-                    await ch.get_partial_message(int(board["board_msg_id"])).edit(
-                        embed=board_embed(board, cfg), view=board_view(board))
+                    await ch.get_partial_message(int(board["board_msg_id"])).edit(**board_message(board, cfg))
             except discord.HTTPException:
                 log.exception("Could not edit Fireball board %s", board_id)
             try:
@@ -2329,7 +2402,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         notes_msg = await thread.send(notes_text(board, interaction.user.display_name, host_pay),
                                       view=notes_view(board["id"]))
         board["notes_message_id"] = str(notes_msg.id)
-        board_msg = await thread.send(embed=board_embed(board, cfg), view=board_view(board))
+        board_msg = await thread.send(**board_message(board, cfg))
         board["board_msg_id"] = str(board_msg.id)
         async with self.store.lock:
             self.store.data["boards"][board["id"]] = board
