@@ -72,6 +72,7 @@ FINALE_WAIT_SCALE = 1.0       # 1.0 = wait for the race GIF to finish playing be
 
 DEFAULT_CONFIG = {
     "lock_minutes": 10,     # board locks this many minutes before the draw
+    "theme": "normal",      # normal | halloween (looks only; /fireball theme)
 }
 CONFIG_LIMITS = {
     "lock_minutes": (0, 240),
@@ -91,8 +92,58 @@ STEVE_LINES = [
 ]
 
 
-def steve() -> str:
-    return random.choice(STEVE_LINES)
+# --- themes ----------------------------------------------------------------
+# Looks only: embed colours, emoji, headers and Steve's lines. Nothing here touches
+# claims, the satellite, the draw or sips. Switch with /fireball theme.
+THEMES = {
+    "normal": {
+        "label": "Normal",
+        "colors": {"open": 0xE67E22, "satellite": 0xF1C40F, "animating": 0xE74C3C,
+                   "locked": 0x7F8C8D, "settled": 0x2ECC71, "cancelled": 0x95A5A6},
+        "fire": "🔥", "duck": "🦆🔥", "tag": "",
+        "board_title": "🔥 Fireball",
+        "sat_title": "🦆🔥 Fireball Satellite",
+        "open_line": "🔥 **Fireball {code} is open!**",
+        "sat_open_line": "🦆🔥 **SATELLITE for Fireball {code}** is open!",
+        "spin": "🌀 **Spinning the ducks!**",
+        "race": "🔥🔥 **THE DUCKS ARE ON FIRE** 🔥🔥",
+        "race_quip": "*Quack chaos!*",
+        "settled": "🔥 **The fire has settled. Burnin' happy!** The last ducks standing:",
+        "congrats": "🏆 Quack chaos! Congrats",
+        "lines": [],
+    },
+    "halloween": {
+        "label": "Halloween 🎃",
+        "colors": {"open": 0xFF6F00, "satellite": 0x8E24AA, "animating": 0xB71C1C,
+                   "locked": 0x4A148C, "settled": 0x7CB342, "cancelled": 0x37474F},
+        "fire": "🎃", "duck": "🧟🦆", "tag": " 🎃",
+        "board_title": "🎃 Fireball",
+        "sat_title": "🧟🦆 Fireball Satellite · The Graveyard",
+        "open_line": "🎃 **Fireball {code} rises from the grave!**",
+        "sat_open_line": "🧟🦆 **THE GRAVEYARD (satellite) for Fireball {code}** is open!",
+        "spin": "🔮 **Stirring the cauldron...**",
+        "race": "🎃🔥 **THE DUCKS ARE CURSED** 🔥🎃",
+        "race_quip": "*Quack chaos from beyond the grave!*",
+        "settled": "🪦 **The curse has lifted. Burnin' happy!** The ducks still haunting the pond:",
+        "congrats": "🏆 Trick or treat! Congrats",
+        "lines": [
+            "Quack chaos from beyond the grave!", "Trick or treat, your digit's dead.",
+            "Boo! ...sorry, hiccups. *sips bourbon*", "I'm not a ghost, I'm just very on fire.",
+            "The pumpkin spice is a lie. The fire is real.", "Zombie ducks don't quack. They QUAAAACK.",
+            "Smells like burnt feathers and candy corn.",
+        ],
+    },
+}
+_theme_by_guild: dict[str, str] = {}     # filled from the saved config when the cog loads
+
+
+def theme(board: dict | None = None, guild_id=None) -> dict:
+    gid = str(guild_id) if guild_id is not None else (str(board.get("guild_id")) if board else "")
+    return THEMES.get(_theme_by_guild.get(gid, "normal"), THEMES["normal"])
+
+
+def steve(board: dict | None = None) -> str:
+    return random.choice(STEVE_LINES + theme(board)["lines"])
 
 
 BURN_QUIPS = [
@@ -234,7 +285,7 @@ def result_text(board: dict, holder: dict | None, fireball: int) -> str:
                 f"Buy back: {fmt_num(total)} * .9 = {fmt_num(bb)}\n"
                 f"Buyback if winner didn't sip: {fmt_num(bb)} - {fmt_num(dc)} = {fmt_num(max(0, bb - dc))}\n```")
         else:
-            lines.append(f"🏆 Quack chaos! Congrats <@{holder['user_id']}>! Digit **{fireball}**{via} wins the **{esc(str(board['prize']))}** prize!")
+            lines.append(f"{theme(board)['congrats']} <@{holder['user_id']}>! Digit **{fireball}**{via} wins the **{esc(str(board['prize']))}** prize!")
     else:
         lines.append(f"Nobody held digit **{fireball}**. No winner this draw.")
     names = ticket_names(board)
@@ -245,7 +296,7 @@ def result_text(board: dict, holder: dict | None, fireball: int) -> str:
                        for u, a in sorted(per.items(), key=lambda kv: -kv[1]))
     lines.append(f"{TALLY_EMOJI} **Per player:** {roster or 'none'}\n"
                  f"{TALLY_EMOJI} **Total: {fmt_num(total)}**")
-    lines.append(f"🦆🔥 *{steve()}*")
+    lines.append(f"{theme(board)['duck']} *{steve(board)}*")
     text = "\n".join(lines)
     return text if len(text) <= 1900 else text[:1890] + "…"
 
@@ -838,14 +889,14 @@ def board_embed(board: dict, cfg: dict) -> discord.Embed:
             lines.append(f"`{d}`  🔒 *reserved for satellite winners*")
         else:
             lines.append(f"`{d}`  — open")
-    colors = {"open": 0xE67E22, "satellite": 0xF1C40F, "animating": 0xE74C3C,
-              "locked": 0x7F8C8D, "settled": 0x2ECC71, "cancelled": 0x95A5A6}
+    th = theme(board)
+    colors = th["colors"]
     emb = discord.Embed(
-        title=f"🔥 Fireball{(' ' + board['code']) if board.get('code') else ''} — {draw_title(board)}",
+        title=f"{th['board_title']}{(' ' + board['code']) if board.get('code') else ''} — {draw_title(board)}",
         description=(f"**Prize:** {esc(str(board['prize']))}  *(winner takes all)* · "
                      f"each digit is worth **{board['digit_cost']}**"
                      f"{' · **90% BB**' if board.get('bb') else ''}\n\n" + "\n".join(lines)),
-        color=colors.get(status, 0xE67E22),
+        color=colors.get(status, colors["open"]),
     )
     if status == "open" and board.get("sat_at"):
         state_text_override = "7 digits are claimed! The satellite opens in a few seconds. Grab a digit now if you want one."
@@ -882,7 +933,7 @@ def sat_embed(board: dict, cfg: dict) -> discord.Embed:
         pref_text = "\n\n**Spot preferences:**\n" + "\n".join(
             f"<@{uid}> " + ",".join(str(d) for d in lst) for uid, lst in prefs.items() if lst)
     emb = discord.Embed(
-        title="🦆🔥 Fireball Satellite",
+        title=theme(board)["sat_title"],
         description=(
             f"**{taken}/{SAT_SPOTS}** spots filled · {TALLY_EMOJI}**{board['sat_cost']}** each.\n"
             + (f"🔔 **The satellite is full!** The shuffle starts {ts(board['sat']['fill_at'], 'R')}. "
@@ -892,7 +943,7 @@ def sat_embed(board: dict, cfg: dict) -> discord.Embed:
             f"Tap **⭐ Preferences** to rank those digits. Winners get their best available pick.\n\n"
             f"{roster}" + pref_text
         ),
-        color=0xF1C40F if board["status"] == "satellite" else 0x7F8C8D,
+        color=theme(board)["colors"]["satellite" if board["status"] == "satellite" else "locked"],
     )
     return emb
 
@@ -1040,8 +1091,9 @@ def bb_view(board_id: str, disabled: bool = False) -> discord.ui.View:
     return view
 
 
-def thread_name(tag: str, code: str | None) -> str:
-    return f"[{tag}] - {code}"[:100] if code else f"[{tag}]"
+def thread_name(tag: str, code: str | None, board: dict | None = None) -> str:
+    deco = theme(board)["tag"]
+    return f"[{tag}]{deco} - {code}"[:100] if code else f"[{tag}]{deco}"
 
 
 def short(name: str, n: int = 9) -> str:
@@ -1192,6 +1244,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         _active_cog = self
         self.bot.add_dynamic_items(BoardButton, SatButton, SipButton, NotesButton, BBButton)
         self.session = aiohttp.ClientSession()
+        for gid, g in self.store.data.get("guilds", {}).items():
+            _theme_by_guild[str(gid)] = (g.get("config") or {}).get("theme", "normal")
         self.tick.start()
 
     async def cog_unload(self):
@@ -1323,7 +1377,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         ch = await self._chan_by_id(tid)
         if isinstance(ch, discord.Thread):
             try:
-                await ch.edit(name=thread_name(tag, "SAT " + board["code"]))
+                await ch.edit(name=thread_name(tag, "SAT " + board["code"], board))
             except discord.HTTPException:
                 log.warning("Couldn't rename Fireball satellite thread %s", board["id"])
 
@@ -1367,7 +1421,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         ch = await self._channel(board)
         if isinstance(ch, discord.Thread):
             try:
-                await ch.edit(name=thread_name(tag, board["code"]))
+                await ch.edit(name=thread_name(tag, board["code"], board))
             except discord.HTTPException:
                 log.warning("Couldn't rename Fireball thread %s", board["id"])
 
@@ -1911,7 +1965,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                     file = None
                 main_link = main.mention if main is not None else "the main thread"
                 text = (
-                    f"🦆🔥 **SATELLITE for Fireball {esc(snap.get('code') or '')}** is open! {draw_title(snap)}\n"
+                    f"{theme(snap)['sat_open_line'].format(code=esc(snap.get('code') or ''))} {draw_title(snap)}\n"
                     f"This is the **satellite**, not the main game. The last {len(snap['sat']['reserved'])} "
                     f"(**{', '.join(str(d) for d in snap['sat']['reserved'])}**) are decided here. "
                     f"10 spots at {TALLY_EMOJI}**{snap['sat_cost']}** each; the last {len(snap['sat']['reserved'])} duck(s) still burning win a digit "
@@ -1919,7 +1973,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 kw = {"file": file} if file is not None else {}
                 ann = await parent.send(text, **kw)
                 thread = await ann.create_thread(
-                    name=thread_name("OPEN", "SAT " + (snap.get("code") or "")), auto_archive_duration=1440)
+                    name=thread_name("OPEN", "SAT " + (snap.get("code") or ""), snap), auto_archive_duration=1440)
                 snap["sat"]["announce_msg_id"] = str(ann.id)
             except discord.HTTPException:
                 log.exception("Could not create the satellite thread for board %s", board_id)
@@ -1990,7 +2044,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             ch = await self._sat_channel(snap)
 
             if animate and ch is not None:
-                await self._play_shuffle(ch, labels, out, snap["sat"]["spots"])
+                await self._play_shuffle(ch, labels, out, snap["sat"]["spots"], snap)
                 await self._play_fire(ch, labels, out, snap)
 
             async with self.store.lock:
@@ -2013,8 +2067,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             main_ch = await self._channel(snap)
             await self._sat_say(
                 snap,
-                "🔥 **The fire has settled. Burnin' happy!** The last ducks standing:\n" + "\n".join(lines) +
-                f"\n\nThe board is full. Draw at {ts(snap['draw_at'], 't')}. I'll be back with the numbers. {steve()}",
+                theme(snap)["settled"] + "\n" + "\n".join(lines) +
+                f"\n\nThe board is full. Draw at {ts(snap['draw_at'], 't')}. I'll be back with the numbers. {steve(snap)}",
             )
             if sat_ch is not None and main_ch is not None and sat_ch.id != main_ch.id:
                 names = ", ".join(
@@ -2029,7 +2083,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         except Exception:
             log.exception("Fireball finale crashed for board %s", board_id)
 
-    async def _play_shuffle(self, ch, labels: list[str], out: dict, spots: list | None = None):
+    async def _play_shuffle(self, ch, labels: list[str], out: dict, spots: list | None = None, board: dict | None = None):
         """Each spin is its own message and stays in the thread, so everyone can read back through them."""
         rounds = out["rounds"]
         total = len(rounds)
@@ -2042,7 +2096,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             return f"<@{sp['user_id']}>" + (f" (spot #{idx + 1})" if multi else "")
 
         none = discord.AllowedMentions.none()
-        await self._send(ch, f"🌀 **Spinning the ducks!** {steve()}")
+        await self._send(ch, f"{theme(board)['spin']} {steve(board)}")
         await asyncio.sleep(SHUFFLE_DELAY)
         for r, perm in enumerate(rounds, start=1):
             if r < total:
@@ -2065,7 +2119,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 render_finale_gif, labels, out["elim_order"], out["winners"], board["id"])
             if len(gif) > 7_500_000:
                 raise RuntimeError(f"finale GIF too big ({len(gif)} bytes)")
-            msg = await self._send(ch, "🔥🔥 **THE DUCKS ARE ON FIRE** 🔥🔥 *Quack chaos!*",
+            msg = await self._send(ch, f"{theme(board)['race']} {theme(board)['race_quip']}",
                                    file=discord.File(io.BytesIO(gif), filename="duck-fire.gif"))
             await asyncio.sleep(seconds * FINALE_WAIT_SCALE)
             # GIFs loop forever in Discord, so swap it for the still final frame once it has played.
@@ -2094,7 +2148,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                     rows.append(f"{icons['dead']} ~~{esc(lab)}~~")
                 else:
                     rows.append(f"{icons[state[i]]} **{esc(lab)}**")
-            return "🔥🔥 **THE DUCKS ARE ON FIRE** 🔥🔥\n" + "\n".join(rows) + f"\n\n*{note}*"
+            return theme(board)["race"] + "\n" + "\n".join(rows) + f"\n\n*{note}*"
 
         msg = await self._send(ch, render("Ten ducks. Three survive. Nobody is safe..."))
         await asyncio.sleep(FIRE_DELAY)
@@ -2182,7 +2236,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             self.store.save()
             snap = json.loads(json.dumps(board))
         pick = "-".join(str(b) for b in balls) if balls else "n/a"
-        emb = discord.Embed(title="Illinois Pick 3 Results", color=0x2ECC71 if holder else 0x95A5A6)
+        emb = discord.Embed(title="Illinois Pick 3 Results",
+                            color=theme(snap)["colors"]["settled" if holder else "cancelled"])
         emb.add_field(name="Fireball", value=str(fireball), inline=True)
         emb.add_field(name="Otherballs", value=", ".join(str(b) for b in balls) if balls else "n/a", inline=True)
         emb.add_field(name="Link", value=RESULTS_URL, inline=False)
@@ -2250,14 +2305,14 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         board["bb"] = bool(bb)
         image_file = await image.to_file()
         announcement = await interaction.channel.send(
-            f"🔥 **Fireball {esc(code)} is open!** {draw_title(board)}\n"
+            f"{theme(board)['open_line'].format(code=esc(code))} {draw_title(board)}\n"
             f"Prize: **{int(prize)}** (winner takes all). Each digit is worth {TALLY_EMOJI}**{board['digit_cost']}**."
             f"{' **90% BB** (buyback) is on.' if bb else ''}\n"
             f"Hosted by {interaction.user.mention}. Claims close {ts(board['lock_at'], 'R')}.",
             file=image_file,
         )
         try:
-            thread = await announcement.create_thread(name=thread_name("OPEN", code), auto_archive_duration=1440)
+            thread = await announcement.create_thread(name=thread_name("OPEN", code, board), auto_archive_duration=1440)
         except discord.Forbidden:
             await interaction.followup.send(
                 "I don't have permission to create threads here. The bot needs the "
@@ -2397,6 +2452,30 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         lines = "\n".join(f"`{k}`: **{v}**" for k, v in cfg.items())
         await interaction.response.send_message(
             ("Updated.\n" if changes else "Current Fireball settings:\n") + lines, ephemeral=True)
+
+    @app_commands.command(name="theme", description="Admin: change the Fireball look (colors, emoji, Steve's lines)")
+    @app_commands.describe(look="Which theme to use from now on")
+    @app_commands.choices(look=[app_commands.Choice(name="Normal 🔥", value="normal"),
+                                app_commands.Choice(name="Halloween 🎃", value="halloween")])
+    async def theme_cmd(self, interaction: discord.Interaction, look: app_commands.Choice[str] | None = None):
+        if not is_admin(interaction):
+            await interaction.response.send_message("Admins only.", ephemeral=True)
+            return
+        if look is None:
+            cur = THEMES[_theme_by_guild.get(str(interaction.guild_id), "normal")]["label"]
+            await interaction.response.send_message(f"Current Fireball theme: **{cur}**.", ephemeral=True)
+            return
+        async with self.store.lock:
+            guild_state(self.store.data, interaction.guild_id)["config"]["theme"] = look.value
+            self.store.save()
+            boards = [b["id"] for b in self.store.data["boards"].values()
+                      if str(b["guild_id"]) == str(interaction.guild_id) and b["status"] in ACTIVE_STATUSES + ("locked",)]
+        _theme_by_guild[str(interaction.guild_id)] = look.value
+        await interaction.response.send_message(
+            f"Fireball theme is now **{THEMES[look.value]['label']}**. New games use it right away; "
+            f"live boards get recoloured now.", ephemeral=True)
+        for bid in boards:
+            await self._refresh(bid)
 
     @app_commands.command(name="result", description="Host: enter or re-check the Fireball result")
     @app_commands.describe(fireball="The Fireball digit (leave blank to re-check illinoislottery.com now)")
