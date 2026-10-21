@@ -117,6 +117,7 @@ THEMES = {
         "colors": {"open": 0xFF6F00, "satellite": 0x8E24AA, "animating": 0xB71C1C,
                    "locked": 0x4A148C, "settled": 0x7CB342, "cancelled": 0x37474F},
         "fire": "🎃", "duck": "🧟🦆", "tag": " 🎃",
+        "banner": "halloween_banner.jpg",     # picture across the top of the board panel (file next to fireball.py)
         "board_title": "🎃 Fireball",
         "sat_title": "🧟🦆 Fireball Satellite · The Graveyard",
         "open_line": "🎃 **Fireball {code} rises from the grave!**",
@@ -943,6 +944,12 @@ def board_panel(board: dict, cfg: dict):
     live = status == "open"
     color = th["colors"].get(status, th["colors"]["open"])
     container = ui.Container(accent_color=discord.Color(color))
+    files: list[discord.File] = []
+    banner = th.get("banner")
+    if banner and Path(__file__).with_name(banner).exists():
+        f = discord.File(Path(__file__).with_name(banner), filename=banner)
+        files.append(f)
+        container.add_item(ui.MediaGallery().add_item(media=f))
     container.add_item(ui.TextDisplay(
         f"## {th['board_title']}{(' ' + esc(board['code'])) if board.get('code') else ''} — {draw_title(board)}\n"
         f"**Prize:** {esc(str(board['prize']))}  *(winner takes all)* · each digit is worth **{board['digit_cost']}**"
@@ -980,15 +987,18 @@ def board_panel(board: dict, cfg: dict):
     container.add_item(row)
     view = ui.LayoutView(timeout=None)
     view.add_item(container)
-    return view
+    return view, files
 
 
-def board_message(board: dict, cfg: dict) -> dict:
+def board_message(board: dict, cfg: dict, edit: bool = False) -> dict:
     """kwargs for send()/edit() of the main board message, in whichever layout this discord.py supports."""
     if USE_PANEL_LAYOUT:
         try:
-            return {"content": None, "embed": None, "view": board_panel(board, cfg),
-                    "allowed_mentions": discord.AllowedMentions.none()}
+            view, files = board_panel(board, cfg)
+            kw = {"content": None, "embed": None, "view": view,
+                  "allowed_mentions": discord.AllowedMentions.none()}
+            kw["attachments" if edit else "files"] = files
+            return kw
         except Exception:
             log.exception("Panel layout failed for board %s; using the embed instead", board["id"])
     return {"embed": board_embed(board, cfg), "view": board_view(board)}
@@ -1475,7 +1485,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 return
             try:
                 if board["board_msg_id"]:
-                    await ch.get_partial_message(int(board["board_msg_id"])).edit(**board_message(board, cfg))
+                    await ch.get_partial_message(int(board["board_msg_id"])).edit(**board_message(board, cfg, edit=True))
             except discord.HTTPException:
                 log.exception("Could not edit Fireball board %s", board_id)
             try:
