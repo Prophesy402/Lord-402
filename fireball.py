@@ -66,6 +66,31 @@ SAT_PREF_DELAY = 30           # seconds between the satellite filling and the sh
 SAT_DELAY = 5                 # seconds after the 7th digit before the satellite opens (last chance for others)
 SIP_WORDS = {"sip", "sipped"}                               # "I've sent the host my tickets"
 REMIND_COOLDOWN = 60                                        # seconds between 🔔 Remind sips presses
+RIGGED_PATTERN = re.compile(r"\b(rigged|rig|rigging|scam|scammed|scamming|fixed|cheat|cheated|cheating|cheater|bullshit|bs)\b", re.I)
+RIGGED_COOLDOWN = 45                                        # seconds between comebacks in one thread
+RIGGED_LINES = [
+    "The only thing rigged was how I rigged your mom from the ceiling last night.",
+    "Rigged? The only fix here is the one your mom asked for at 2 AM.",
+    "Not rigged. Your luck just has the same track record as your dad's marriage.",
+    "I'm a duck on fire running a lottery. If I could rig anything, I'd rig myself a fire extinguisher.",
+    "Rigged is a strong word. 'Skill issue' is shorter.",
+    "The numbers come from the Illinois Lottery, {name}. Take it up with Springfield. Or your mom, she's usually up.",
+    "Lose a digit, blame the duck. Classic. Your mom blames the duck too, but for different reasons.",
+    "Rigged? I don't even have hands. I have wings. Flaming wings. Your mom loves them.",
+    "If this were rigged, {name}, I'd at least let you win once so you'd stop crying.",
+    "The only thing fixed around here is your mom's Wi-Fi. I came over and handled it personally.",
+    "Rigged? Buddy, I can't even rig a bedsheet. Ask your mom, she had to do it.",
+    "Odds are 1 in 10, {name}. Your mom's odds were 10 in 10 and she still called it fair.",
+    "Every digit's got the same chance. Unlike you, who's got no chance. Quack.",
+    "Rigged! says the guy who picked 7 because it's his 'lucky number.' Your mom's lucky number is me.",
+    "I'd rig it for you, {name}, but your mom already asked me to rig it for her.",
+    "Not rigged. Just cursed. Like your bloodline.",
+    "The lottery's random, {name}. The only thing that's never random is your mom's reply to my texts.",
+    "Keep saying rigged. I'll keep saying your mom. We both know who's winning this.",
+    "Scam? The only scam here is whoever told you that haircut was a good idea.",
+    "Rigged, says the man who's 0 for 6 this week. At this point it's not luck, it's a lifestyle.",
+    "Even on fire I'm more honest than your fantasy football trades, {name}.",
+]
 MIN_ROUNDS, MAX_ROUNDS = 3, 12
 SHUFFLE_DELAY = 2.5           # seconds between shuffle rounds
 FIRE_DELAY = 2.2              # seconds between finale edits (text fallback only)
@@ -1703,6 +1728,29 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             return
         if message.content.strip().lower() in SIP_WORDS:
             await self._handle_sip(message)
+            return
+        if RIGGED_PATTERN.search(message.content):
+            await self._talk_back(message)
+
+    async def _talk_back(self, message: discord.Message):
+        """Somebody in a Fireball thread cried 'rigged'. Steve has thoughts."""
+        async with self.store.lock:
+            board = self._board_for_channel(str(message.channel.id))
+        if not board:
+            return
+        now = datetime.now(timezone.utc).timestamp()
+        last = self.__dict__.setdefault("_rig_last", {})
+        if now - last.get(message.channel.id, 0) < RIGGED_COOLDOWN:
+            return
+        last[message.channel.id] = now
+        line = random.choice(RIGGED_LINES).format(name=esc(message.author.display_name))
+        try:
+            await message.reply(line, mention_author=False)
+        except discord.HTTPException:
+            try:
+                await self._send(message.channel, line)
+            except discord.HTTPException:
+                pass
 
     async def _submit_sip(self, board_id: str, member, channel, jump_url: str) -> str | None:
         """
