@@ -1053,7 +1053,7 @@ class BoardButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fb:(?P<b
         await cog.on_board_click(interaction, self.board_id, self.action)
 
 
-class SatButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fs:(?P<board>[0-9a-f]+):(?P<action>s\d|yolo|pref|x1)"):
+class SatButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fs:(?P<board>[0-9a-f]+):(?P<action>s\d|yolo|pref|x1|sip|host|admin)"):
     def __init__(self, board_id: str, action: str, label: str = "?", style=discord.ButtonStyle.secondary,
                  disabled: bool = False, row: int | None = None):
         super().__init__(discord.ui.Button(
@@ -1261,6 +1261,10 @@ def sat_view(board: dict) -> discord.ui.View:
     view.add_item(SatButton(board["id"], "x1", "X1", discord.ButtonStyle.primary, not live, row=0))
     view.add_item(SatButton(board["id"], "pref", "⭐ Preferences", discord.ButtonStyle.secondary,
                             board["status"] != "satellite", row=0))
+    done = board["status"] == "cancelled"
+    view.add_item(SatButton(board["id"], "sip", "💸 Sip", discord.ButtonStyle.success, done or not board["ledger"], row=1))
+    view.add_item(SatButton(board["id"], "host", "Host Controls", discord.ButtonStyle.primary, done, row=1))
+    view.add_item(SatButton(board["id"], "admin", "Admin Controls", discord.ButtonStyle.primary, done, row=1))
     return view
 
 
@@ -1628,6 +1632,9 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             asyncio.create_task(self._open_sat_flow(board_id, delay=SAT_DELAY))
 
     async def on_sat_click(self, interaction: discord.Interaction, board_id: str, action: str):
+        if action in ("sip", "host", "admin"):          # same buttons as the main board, reachable from the satellite thread
+            await self.on_board_click(interaction, board_id, action)
+            return
         user = interaction.user
         filled = False
         async with self.store.lock:
@@ -2011,15 +2018,23 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         else:
             note = (f"❌ The host denied your sip ({TALLY_EMOJI}**{fmt_num(s['amount'])}**) on {game}. "
                     f"Sort it out with them, then sip again.")
-        # Tell the player privately; the board's Sips list shows everyone the tally.
+        # Tell the player privately, and post it in the feed so everyone sees the sip was accepted.
         try:
             player = self.bot.get_user(int(user_id)) or await self.bot.fetch_user(int(user_id))
             await player.send(note)
         except (discord.HTTPException, ValueError):
-            ch = await self._chan_by_id(s.get("channel_id")) or await self._channel(snap)
-            if ch is not None:
+            pass
+        if approve:
+            feed = (f"{TALLY_EMOJI} **Sip confirmed:** <@{user_id}> sipped {TALLY_EMOJI}**{fmt_num(s['amount'])}** "
+                    f"on {game}. Thanks! {steve(snap)}")
+        else:
+            feed = f"❌ **Sip denied:** <@{user_id}>'s sip of {TALLY_EMOJI}**{fmt_num(s['amount'])}** on {game} wasn't accepted. Sort it out with the host."
+        posted = set()
+        for ch in (await self._channel(snap), await self._chan_by_id(s.get("channel_id"))):
+            if ch is not None and ch.id not in posted:
+                posted.add(ch.id)
                 try:
-                    await self._send(ch, f"<@{user_id}> {note}")
+                    await self._send(ch, feed, allowed_mentions=discord.AllowedMentions.none())
                 except discord.HTTPException:
                     pass
         await self._refresh(board_id)
