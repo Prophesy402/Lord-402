@@ -61,6 +61,7 @@ RESULT_GIVE_UP_HOURS = 6      # then ask the host to enter it by hand
 
 SAT_THRESHOLD = 7             # digits claimed before the satellite opens
 SAT_SPOTS = 10
+COUNTDOWN_FROM_MIN = 5        # start the once-a-minute "X minutes left" shouts this far before the board closes
 SAT_PREF_DELAY = 30           # seconds between the satellite filling and the shuffle (time to set preferences)
 SAT_DELAY = 5                 # seconds after the 7th digit before the satellite opens (last chance for others)
 SIP_WORDS = {"sip", "sipped"}                               # "I've sent the host my tickets"
@@ -1370,6 +1371,40 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 await self._fill_countdown(bid, wait=0)
             elif b["status"] == "locked" and not b.get("result"):
                 await self._maybe_fetch_result(bid, now)
+            if b["status"] in ("open", "satellite"):
+                await self._closing_countdown(bid, now)
+
+    async def _closing_countdown(self, board_id: str, now: datetime):
+        """Last 5 minutes before the board closes: one shout per minute while digits (or satellite spots) are still open."""
+        async with self.store.lock:
+            b = self.store.data["boards"].get(board_id)
+            if not b or b["status"] not in ("open", "satellite"):
+                return
+            left = (datetime.fromisoformat(b["lock_at"]) - now).total_seconds()
+            if left <= 0 or left > COUNTDOWN_FROM_MIN * 60:
+                return
+            minute = math.ceil(left / 60)               # 5, 4, 3, 2, 1
+            if b.get("countdown_at") == minute:
+                return
+            b["countdown_at"] = minute
+            self.store.save()
+            snap = json.loads(json.dumps(b))
+        if snap["status"] == "satellite":
+            spots_open = sum(1 for x in snap["sat"]["spots"] if not x)
+            if not spots_open:
+                return
+            text = (f"⏰ **{minute} minute{'s' if minute != 1 else ''} left!** The satellite still has **{spots_open}** spot(s) open. "
+                    f"If it doesn't fill, the whole game is killed.")
+            await self._sat_say(snap, text)
+            await self._say(snap, text)
+        else:
+            open_d = open_digits(snap)
+            if not open_d:
+                return
+            text = (f"⏰ **{minute} minute{'s' if minute != 1 else ''} left to grab a digit on Fireball {esc(snap.get('code') or '')}!** "
+                    f"Still open: **{', '.join(str(d) for d in open_d)}**. "
+                    f"{len(open_d)} to go or it's **fill or kill**. {steve(snap)}")
+            await self._say(snap, text)
 
     # ---- helpers ---------------------------------------------------------
 
