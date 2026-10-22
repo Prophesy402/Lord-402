@@ -74,6 +74,7 @@ FINALE_WAIT_SCALE = 1.0       # 1.0 = wait for the race GIF to finish playing be
 DEFAULT_CONFIG = {
     "lock_minutes": 10,     # board locks this many minutes before the draw
     "theme": "normal",      # normal | halloween (looks only; /fireball theme)
+    "host_plays": True,     # may the host claim digits / satellite spots in their own game? (off for real games)
 }
 CONFIG_LIMITS = {
     "lock_minutes": (0, 240),
@@ -205,6 +206,16 @@ def guild_state(data: dict, guild_id: int | str) -> dict:
     g = data["guilds"].setdefault(str(guild_id), {})
     g.setdefault("config", {})
     return g
+
+
+HOST_NO_PLAY = "🚫 Hosts can't take spots in their own game. (Admins can switch this with `/fireball config host_plays`.)"
+
+
+def host_may_play(data: dict, board: dict, user) -> bool:
+    """False when this user hosts the board and the server has turned host play off."""
+    if str(user.id) != board["host_id"]:
+        return True
+    return bool(get_config(data, board["guild_id"]).get("host_plays", True))
 
 
 def get_config(data: dict, guild_id: int | str) -> dict:
@@ -1590,6 +1601,9 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 self.store.save()
                 reply = "Board closed."
             else:
+                if not host_may_play(self.store.data, board, user):
+                    await interaction.response.send_message(HOST_NO_PLAY, ephemeral=True)
+                    return
                 if action.startswith("d"):
                     requested = [int(action[1:])]
                 elif action == "yolo":
@@ -1655,6 +1669,9 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 current = list(board["sat"].get("prefs", {}).get(str(user.id), []))
                 await interaction.response.send_message(
                     pref_text(current, reserved), view=pref_view(self, board_id, reserved, current), ephemeral=True)
+                return
+            if not host_may_play(self.store.data, board, user):
+                await interaction.response.send_message(HOST_NO_PLAY, ephemeral=True)
                 return
             if action in ("x1", "yolo"):
                 free = [i for i, s in enumerate(board["sat"]["spots"]) if not s]
@@ -2567,13 +2584,19 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         await self._retire_sat(snap)
 
     @app_commands.command(name="config", description="Admin: show or change Fireball settings")
-    @app_commands.describe(lock_minutes="Lock claims this many minutes before the draw")
-    async def config(self, interaction: discord.Interaction, lock_minutes: int | None = None):
+    @app_commands.describe(lock_minutes="Lock claims this many minutes before the draw",
+                           host_plays="Can the host claim digits/spots in their own game? (turn off for real games)")
+    async def config(self, interaction: discord.Interaction, lock_minutes: int | None = None,
+                     host_plays: bool | None = None):
         if not is_admin(interaction):
             await interaction.response.send_message("Admins only.", ephemeral=True)
             return
         changes = {} if lock_minutes is None else {"lock_minutes": lock_minutes}
+        if host_plays is not None:
+            changes["host_plays"] = bool(host_plays)
         for k, v in changes.items():
+            if k not in CONFIG_LIMITS:
+                continue
             lo, hi = CONFIG_LIMITS[k]
             if not lo <= v <= hi:
                 await interaction.response.send_message(f"`{k}` must be between {lo} and {hi}.", ephemeral=True)
