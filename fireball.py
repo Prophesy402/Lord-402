@@ -1826,7 +1826,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 continue
             try:
                 await ch.get_partial_message(int(b["notes_message_id"])).edit(
-                    content=notes_text(b, b["host_name"], info), view=notes_view(b["id"]))
+                    content=notes_text(b, b["host_name"], info), view=notes_view(b["id"]), suppress=True)
             except discord.HTTPException:
                 pass
 
@@ -2410,7 +2410,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         if not board["notes"]:
             board["notes"] = host_pay or "(no payment link yet)"
         notes_msg = await thread.send(notes_text(board, interaction.user.display_name, host_pay),
-                                      view=notes_view(board["id"]))
+                                      view=notes_view(board["id"]), suppress_embeds=True)
         board["notes_message_id"] = str(notes_msg.id)
         board_msg = await thread.send(**board_message(board, cfg))
         board["board_msg_id"] = str(board_msg.id)
@@ -2469,7 +2469,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             try:
                 # Re-attaching the view also gives notes posted before the button existed an Edit button.
                 await ch.get_partial_message(int(snap["notes_message_id"])).edit(
-                    content=content, view=notes_view(board_id))
+                    content=content, view=notes_view(board_id), suppress=True)
                 await interaction.response.send_message("✅ Notes updated.", ephemeral=True)
                 return
             except discord.HTTPException:
