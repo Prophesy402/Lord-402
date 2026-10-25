@@ -118,3 +118,5 @@ the platform's own restart policy) so it comes back up if it crashes.
 - Renaming channels requires the bot to have the **Manage Channels**
   permission in that channel; without it, the bot logs a warning and
   keeps going (races still work, the channel name just won't update).
+
+<!-- deploy nudge 2026-10-25 -->
