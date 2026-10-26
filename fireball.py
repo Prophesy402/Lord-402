@@ -66,8 +66,11 @@ SAT_PREF_DELAY = 30           # seconds between the satellite filling and the sh
 SAT_DELAY = 5                 # seconds after the 7th digit before the satellite opens (last chance for others)
 SIP_WORDS = {"sip", "sipped"}                               # "I've sent the host my tickets"
 REMIND_COOLDOWN = 60                                        # seconds between 🔔 Remind sips presses
-RIGGED_PATTERN = re.compile(r"\b(rigged|rig|rigging|scam|scammed|scamming|fixed|cheat|cheated|cheating|cheater|bullshit|bs)\b", re.I)
-RIGGED_COOLDOWN = 45                                        # seconds between comebacks in one thread
+RIGGED_PATTERN = re.compile(
+    r"\b(rigg?(ed|ing)?|scam(med|mer|ming)?|fix(ed)?|cheat(ed|er|ing|s)?|bull ?shit|bs|fraud|crook(ed)?|robbed|robbery|"
+    r"rip ?off|ripped off|bogus|sketch(y)?|fake|unfair|never win|always lose|juiced|cooked|hacked|"
+    r"not random|no way|how is that|wtf|what the f)\b", re.I)
+RIGGED_COOLDOWN = 8                                         # seconds between comebacks in one thread (just stops floods)
 RIGGED_LINES = [
     "The only thing rigged was how I rigged your mom from the ceiling last night.",
     "Rigged? The only fix here is the one your mom asked for at 2 AM.",
