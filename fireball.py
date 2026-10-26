@@ -101,7 +101,7 @@ FINALE_WAIT_SCALE = 1.0       # 1.0 = wait for the race GIF to finish playing be
 
 DEFAULT_CONFIG = {
     "lock_minutes": 10,     # board locks this many minutes before the draw
-    "theme": "normal",      # normal | halloween (looks only; /fireball theme)
+    "theme": "normal",      # normal | halloween | husker (looks only; /fireball theme)
     "host_plays": True,     # may the host claim digits / satellite spots in their own game? (off for real games)
 }
 CONFIG_LIMITS = {
@@ -164,6 +164,28 @@ THEMES = {
             "Smells like burnt feathers and candy corn.",
         ],
     },
+}
+THEMES["husker"] = {
+    "label": "Husker Volleyball 🏐",
+    "colors": {"open": 0xD00000, "satellite": 0xF5F1E7, "animating": 0xB00000,
+               "locked": 0x8B0000, "settled": 0xFFFFFF, "cancelled": 0x5A5A5A},
+    "fire": "🏐", "duck": "🏐🦆", "tag": " 🏐",
+    "banner": "husker_banner.jpg",
+    "board_title": "🏐 Fireball",
+    "sat_title": "🏐🦆 Fireball Satellite · The Bench",
+    "open_line": "🏐 **Fireball {code} is serving!** Go Big Red!",
+    "sat_open_line": "🏐🦆 **THE BENCH (satellite) for Fireball {code}** is open! Three ducks get subbed in.",
+    "spin": "🏐 **Rotating the lineup...**",
+    "race": "🏐🔥 **THE DUCKS ARE SPIKING** 🔥🏐",
+    "race_quip": "*Side out! Quack chaos!*",
+    "settled": "🏐 **Match point. Burnin' happy!** The ducks still on the floor:",
+    "congrats": "🏆 KILL! Congrats",
+    "lines": [
+        "Go Big Red! Quack chaos!", "That's an ace. Your digit? That's a shank.",
+        "Devaney's loud. I'm louder. *sips bourbon*", "Side out, duck out.",
+        "Six rotations, one winner, zero mercy.", "Red and cream, feathers and steam.",
+        "Block party at the net. Your mom's invited.", "Set, spike, sip. In that order.",
+    ],
 }
 _theme_by_guild: dict[str, str] = {}     # filled from the saved config when the cog loads
 
@@ -1146,9 +1168,22 @@ NOTES_MAX_LENGTH = 1800
 
 
 def notes_text(board: dict, fallback_author: str, pay: str | None = None) -> str:
-    """The host notes, with the host's saved pay info added underneath so players know where to send 💰."""
-    return (f"📋 **Host notes ({esc(board.get('notes_author') or fallback_author)}):** {board.get('notes') or ''}\n"
-            f"{pay_line(pay)}")
+    """
+    The host notes plus one 'Send to' line. The pay link is never shown twice: if the notes
+    ARE the link (typed at /fireball start, or auto-filled), only the Send-to line is shown.
+    """
+    notes = (board.get("notes") or "").strip()
+    if notes == "(no payment link yet)":
+        notes = ""
+    if pay and notes == pay.strip():
+        notes = ""
+    if not pay and notes:          # a link typed at start with nothing saved in /payinfo
+        pay, notes = notes, ""
+    parts = []
+    if notes:
+        parts.append(f"📋 **Host notes ({esc(board.get('notes_author') or fallback_author)}):** {notes}")
+    parts.append(pay_line(pay))
+    return "\n".join(parts)
 
 
 class NotesButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fn:(?P<board>[0-9a-f]+)"):
@@ -2526,7 +2561,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         async with self.store.lock:
             host_pay = get_pay(self.store.data, interaction.user.id)
         if not board["notes"]:
-            board["notes"] = host_pay or "(no payment link yet)"
+            board["notes"] = ""          # notes_text() shows the saved /payinfo link on its own
         notes_msg = await thread.send(notes_text(board, interaction.user.display_name, host_pay),
                                       view=notes_view(board["id"]), suppress_embeds=True)
         board["notes_message_id"] = str(notes_msg.id)
@@ -2663,7 +2698,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
     @app_commands.command(name="theme", description="Admin: change the Fireball look (colors, emoji, Steve's lines)")
     @app_commands.describe(look="Which theme to use from now on")
     @app_commands.choices(look=[app_commands.Choice(name="Normal 🔥", value="normal"),
-                                app_commands.Choice(name="Halloween 🎃", value="halloween")])
+                                app_commands.Choice(name="Halloween 🎃", value="halloween"),
+                                app_commands.Choice(name="Husker Volleyball 🏐", value="husker")])
     async def theme_cmd(self, interaction: discord.Interaction, look: app_commands.Choice[str] | None = None):
         if not is_admin(interaction):
             await interaction.response.send_message("Admins only.", ephemeral=True)
