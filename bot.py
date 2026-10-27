@@ -61,6 +61,18 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 SPOT_CALL_RE = re.compile(r"^x(\d{1,3})$", re.IGNORECASE)
 CONFIRM_WORDS = {"confirm", "confirmed", "ready", "in", "i'm in", "im in", "sip", "sipped"}
+DUCK_MOD_ROLE_WORDS = ("duck mod", "duckmod")   # any role whose name contains one of these counts as a duck mod
+
+
+def is_duck_mod(member) -> bool:
+    """Server admins, or anyone holding a 'Duck Mod' role."""
+    if not isinstance(member, discord.Member):
+        return False
+    if member.guild_permissions.administrator:
+        return True
+    return any(any(w in r.name.lower() for w in DUCK_MOD_ROLE_WORDS) for r in member.roles)
+
+
 VOUCH_RE = re.compile(r"^vouch for\s+<@!?(\d+)>", re.IGNORECASE)
 FORCE_SIP_RE = re.compile(r"^force sip\s+<@!?(\d+)>", re.IGNORECASE)
 RESULT_LINE_RE = re.compile(r"^\s*\d{1,3}[\.\)]\s+\S+", re.MULTILINE)
@@ -519,16 +531,93 @@ async def handle_confirm(message: discord.Message):
         await message.reply("Already got your confirmation. 👍", mention_author=False)
         return
 
-    race["confirmed"].append(user_id)
-    vouched = race.setdefault("vouched", [])
-    if user_id in vouched:
-        vouched.remove(user_id)
+    # Host or duck mod typing sip for themselves counts straight away (nobody else can confirm them).
+    if str(message.author.id) == race["opened_by"] or is_duck_mod(message.author):
+        _mark_confirmed(race, user_id)
+        save_race(channel_id, race)
+        await message.reply(f"✅ Got it, {message.author.mention}!", mention_author=False)
+        if race["status"] == "pending" and set(race["confirmed"]) >= set(totals.keys()):
+            await message.channel.send(waiting_on_host_message(race))
+        return
+
+    pending = race.setdefault("sip_pending", [])
+    if user_id in pending:
+        await message.reply("⏳ Already waiting on the host to confirm your sip.", mention_author=False)
+        return
+    pending.append(user_id)
     save_race(channel_id, race)
+    await message.reply(
+        f"📨 Sip noted, {message.author.mention} — waiting on <@{race['opened_by']}> (or a duck mod) to confirm it.",
+        mention_author=False,
+        view=SipConfirmView(user_id),
+    )
 
-    await message.reply(f"✅ Got it, {message.author.mention}!", mention_author=False)
 
-    if race["status"] == "pending" and set(race["confirmed"]) >= set(totals.keys()):
-        await message.channel.send(waiting_on_host_message(race))
+def _mark_confirmed(race: dict, user_id: str) -> None:
+    if user_id not in race["confirmed"]:
+        race["confirmed"].append(user_id)
+    for key in ("vouched", "sip_pending"):
+        lst = race.setdefault(key, [])
+        if user_id in lst:
+            lst.remove(user_id)
+
+
+class SipConfirmView(discord.ui.View):
+    """Confirm / Deny under a player's sip. Only the host or a duck mod can press them.
+    The player id rides in the custom_id, so the buttons keep working after a restart."""
+
+    def __init__(self, user_id: str = "0"):
+        super().__init__(timeout=None)
+        self.add_item(SipConfirmButton(user_id, True))
+        self.add_item(SipConfirmButton(user_id, False))
+
+
+class SipConfirmButton(discord.ui.DynamicItem[discord.ui.Button],
+                       template=r"duckbot:sip:(?P<user>\d+):(?P<verdict>ok|no)"):
+    def __init__(self, user_id: str, ok: bool):
+        super().__init__(discord.ui.Button(
+            label="✅ Confirm sip" if ok else "❌ Deny",
+            style=discord.ButtonStyle.success if ok else discord.ButtonStyle.danger,
+            custom_id=f"duckbot:sip:{user_id}:{'ok' if ok else 'no'}"))
+        self.user_id, self.ok = user_id, ok
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        return cls(match["user"], match["verdict"] == "ok")
+
+    async def callback(self, interaction: discord.Interaction):
+        race = get_race(interaction.channel_id)
+        if not race:
+            await interaction.response.send_message("No race is set up in this channel.", ephemeral=True)
+            return
+        if str(interaction.user.id) != race["opened_by"] and not is_duck_mod(interaction.user):
+            await interaction.response.send_message("Only the host or a duck mod can confirm sips.", ephemeral=True)
+            return
+        totals = entry_totals(race)
+        names = participant_names(race)
+        target = names.get(self.user_id, f"<@{self.user_id}>")
+        if self.user_id in race["confirmed"]:
+            await interaction.response.edit_message(view=None)
+            await interaction.followup.send(f"{target} is already confirmed.", ephemeral=True)
+            return
+        if self.ok:
+            _mark_confirmed(race, self.user_id)
+            save_race(interaction.channel_id, race)
+            await interaction.response.edit_message(view=None)
+            await interaction.channel.send(
+                f"✅ **Sip confirmed:** {interaction.user.mention} confirmed <@{self.user_id}>'s sip.",
+                allowed_mentions=discord.AllowedMentions.none())
+            if race["status"] == "pending" and set(race["confirmed"]) >= set(totals.keys()):
+                await interaction.channel.send(waiting_on_host_message(race))
+        else:
+            pending = race.setdefault("sip_pending", [])
+            if self.user_id in pending:
+                pending.remove(self.user_id)
+            save_race(interaction.channel_id, race)
+            await interaction.response.edit_message(view=None)
+            await interaction.channel.send(
+                f"❌ **Sip denied:** {interaction.user.mention} didn't see <@{self.user_id}>'s sip. "
+                f"Sort it out, then type `sip` again.")
 
 
 async def handle_vouch(message: discord.Message, target_id: str):
@@ -581,14 +670,10 @@ async def handle_force_sip(message: discord.Message, target_id: str):
     if not sip_allowed:
         return
 
-    is_admin = (
-        isinstance(message.author, discord.Member)
-        and message.author.guild_permissions.administrator
-    )
     is_host = str(message.author.id) == race["opened_by"]
-    if not (is_host or is_admin):
+    if not (is_host or is_duck_mod(message.author)):
         await message.reply(
-            "Only the host who opened this race, or an admin, can force a sip.",
+            "Only the host who opened this race, or a duck mod, can force a sip.",
             mention_author=False,
         )
         return
@@ -605,10 +690,7 @@ async def handle_force_sip(message: discord.Message, target_id: str):
         await message.reply(f"{target_name} already sipped.", mention_author=False)
         return
 
-    race["confirmed"].append(target_id)
-    vouched = race.setdefault("vouched", [])
-    if target_id in vouched:
-        vouched.remove(target_id)
+    _mark_confirmed(race, target_id)
     save_race(channel_id, race)
 
     await message.reply(
@@ -671,7 +753,7 @@ async def run_race_shuffle(
         await channel.send("No race is set up in this channel. Start one with `/create race`.")
         return
     if requester_id is not None and requester_id != race["opened_by"] and not requester_is_admin:
-        await channel.send("Only the host who opened this race, or an admin, can run the race.")
+        await channel.send("🚫 Only the host who opened this race, or a duck mod, can run the race.")
         return
     if race["status"] in ("shuffled", "complete"):
         line = random.choice(ALREADY_SHUFFLED_ROASTS).format(code=race["code"])
@@ -750,6 +832,7 @@ async def setup_hook():
     # Re-attach the persistent Edit-notes button so it keeps working on
     # notes messages posted before a restart.
     bot.add_view(NotesEditView())
+    bot.add_dynamic_items(SipConfirmButton)
     # Fireball (Illinois Pick 3) side game lives in its own file, fireball.py.
     # If it ever fails to load, duck races keep working exactly as before.
     # With a FIREBALL_TOKEN set, Fireball runs as its own bot (Pyro Steve) and Lord 402
@@ -790,12 +873,8 @@ async def on_message(message: discord.Message):
 
     if race:
         if race["status"] == "open" and content.strip().lower() in ("yes sats", "no sats"):
-            is_admin = (
-                isinstance(message.author, discord.Member)
-                and message.author.guild_permissions.administrator
-            )
             is_host = str(message.author.id) == race["opened_by"]
-            if is_host or is_admin:
+            if is_host or is_duck_mod(message.author):
                 if content.strip().lower() == "yes sats":
                     if not race.get("sat_notified"):
                         remaining = remaining_spots(race)
@@ -901,12 +980,8 @@ async def on_message(message: discord.Message):
         return
 
     if content.lower() == "!race":
-        is_admin = (
-            isinstance(message.author, discord.Member)
-            and message.author.guild_permissions.administrator
-        )
         await run_race_shuffle(
-            message.channel, channel_id, str(message.author.id), is_admin
+            message.channel, channel_id, str(message.author.id), is_duck_mod(message.author)
         )
         return
 
@@ -953,11 +1028,7 @@ def _notes_text(race: dict, fallback_author: str) -> str:
 
 
 def _can_edit_notes(interaction: discord.Interaction, race: dict) -> bool:
-    is_admin = (
-        isinstance(interaction.user, discord.Member)
-        and interaction.user.guild_permissions.administrator
-    )
-    return is_admin or str(interaction.user.id) == race["opened_by"]
+    return is_duck_mod(interaction.user) or str(interaction.user.id) == race["opened_by"]
 
 
 async def _post_notes(thread: discord.abc.Messageable, race: dict, notes: str, author: str):
@@ -1170,12 +1241,9 @@ async def duck_open_sat(
             "There's no race set up in this thread.", ephemeral=True
         )
         return
-    if str(interaction.user.id) != main_race["opened_by"] and not (
-        isinstance(interaction.user, discord.Member)
-        and interaction.user.guild_permissions.administrator
-    ):
+    if str(interaction.user.id) != main_race["opened_by"] and not is_duck_mod(interaction.user):
         await interaction.response.send_message(
-            "Only the host who opened this race, or an admin, can open a satellite race.",
+            "Only the host who opened this race, or a duck mod, can open a satellite race.",
             ephemeral=True,
         )
         return
@@ -1347,9 +1415,12 @@ def build_status_text(race: dict) -> str:
     if totals:
         lines.append("")
         vouched = race.get("vouched", [])
+        sip_pending = race.get("sip_pending", [])
         for uid, count in totals.items():
             if uid in race["confirmed"]:
                 mark = "✅"
+            elif uid in sip_pending:
+                mark = "📨"
             elif uid in vouched:
                 mark = "🤝"
             else:
