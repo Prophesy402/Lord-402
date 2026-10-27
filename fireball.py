@@ -101,7 +101,7 @@ FINALE_WAIT_SCALE = 1.0       # 1.0 = wait for the race GIF to finish playing be
 
 DEFAULT_CONFIG = {
     "lock_minutes": 10,     # board locks this many minutes before the draw
-    "theme": "normal",      # normal | halloween | husker (looks only; /fireball theme)
+    "theme": "normal",      # normal | halloween | halloween2 | husker (looks only; /fireball theme)
     "host_plays": True,     # may the host claim digits / satellite spots in their own game? (off for real games)
 }
 CONFIG_LIMITS = {
@@ -187,6 +187,19 @@ THEMES["husker"] = {
         "Block party at the net. Your mom's invited.", "Set, spike, sip. In that order.",
     ],
 }
+# Second Halloween look: same colours and wording, different picture and a few extra lines.
+THEMES["halloween2"] = dict(
+    THEMES["halloween"],
+    label="Halloween After Dark 🎃🔥",
+    banner="halloween2_banner.jpg",
+    sat_title="🧟🦆 Fireball Satellite · The Pumpkin Patch",
+    spin="🔮 **Lighting the pumpkin...**",
+    lines=THEMES["halloween"]["lines"] + [
+        "She sits on a flaming pumpkin and still asks why it's hot in here.",
+        "Fishnets and feathers. Happy Halloween, degenerates.",
+        "The pumpkin's lit, the ducks are lit, your mom's lit. Big night.",
+    ],
+)
 _theme_by_guild: dict[str, str] = {}     # filled from the saved config when the cog loads
 
 
@@ -2699,6 +2712,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
     @app_commands.describe(look="Which theme to use from now on")
     @app_commands.choices(look=[app_commands.Choice(name="Normal 🔥", value="normal"),
                                 app_commands.Choice(name="Halloween 🎃", value="halloween"),
+                                app_commands.Choice(name="Halloween After Dark 🎃🔥", value="halloween2"),
                                 app_commands.Choice(name="Husker Volleyball 🏐", value="husker")])
     async def theme_cmd(self, interaction: discord.Interaction, look: app_commands.Choice[str] | None = None):
         if not is_admin(interaction):
