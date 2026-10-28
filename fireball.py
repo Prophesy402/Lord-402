@@ -837,7 +837,9 @@ def offer_chop(board: dict, uid: str, d: int) -> bool:
 def join_chop(board: dict, uid: str, name: str, d: int) -> dict | None:
     """Second player takes the other half of digit d and pays what's left of the digit price."""
     c = board["digits"][str(d)]
-    if not c or not c.get("chop_open") or c.get("chop") or board["status"] not in ("open", "satellite"):
+    if not c or not c.get("chop_open") or c.get("chop"):
+        return None
+    if board["status"] not in ("open", "satellite") and not (c["user_id"] == str(uid) and board["status"] == "locked"):
         return None
     dc = board["digit_cost"]
     if c["user_id"] == str(uid):     # taking your own other half: it's just a whole digit again
@@ -1225,12 +1227,13 @@ def board_panel(board: dict, cfg: dict):
         if c:
             tag = " 🦆" if c.get("via") == "satellite" else ""
             line = f"**{d})** {digit_label(board, c, mention=True)}{tag}"
-            if c.get("chop_open") and not c.get("chop") and status in ("open", "satellite") and board.get("bb") and budget >= 2:
+            if c.get("chop_open") and not c.get("chop") and status in ("open", "satellite", "locked") and board.get("bb") and budget >= 2:
                 budget -= 2
                 # half-open digit: a button right on the row to grab the other half (owner = take it all)
                 container.add_item(ui.Section(
                     ui.TextDisplay(line),
-                    accessory=BoardButton(board["id"], f"full{d}", "🪓 Other half", discord.ButtonStyle.secondary, False)))
+                    accessory=BoardButton(board["id"], f"full{d}", "🪓 Take it all" if status == "locked" else "🪓 Other half",
+                                          discord.ButtonStyle.secondary, False)))
             else:
                 container.add_item(ui.TextDisplay(line))
         elif status == "satellite":
@@ -2281,7 +2284,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         uid = str(user.id)
         async with self.store.lock:
             b = self.store.data["boards"].get(board_id)
-            if not b or b["status"] not in ("open", "satellite") or not b.get("bb"):
+            if not b or b["status"] not in ("open", "satellite", "locked") or not b.get("bb"):
                 await interaction.response.send_message("That digit isn't open for a chop anymore.", ephemeral=True)
                 return
             if not host_may_play(self.store.data, b, user):
@@ -2292,6 +2295,9 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 await interaction.response.send_message("That half's already gone.", ephemeral=True)
                 return
             mine = c["user_id"] == uid
+            if b["status"] == "locked" and not mine:
+                await interaction.response.send_message("Claims are closed; only the holder can finish that digit now.", ephemeral=True)
+                return
             before = owed(b, uid)
             c = join_chop(b, uid, user.display_name, d)
             if c is None:
