@@ -344,8 +344,11 @@ def ticket_terms(board: dict) -> list[str]:
             sats.append(fmt_num(e["amount"]))
         else:
             slots = [x for x in str(e["slot"]).split(",") if x] or [""]
-            for _ in slots:
-                terms.append(fmt_num(e["amount"] / len(slots)))
+            dc, half = board["digit_cost"], chop_share(board)
+            weights = [dc - half if (c := board["digits"].get(x)) and c.get("chop") else dc for x in slots]
+            total_w = sum(weights) or 1
+            for w in weights:
+                terms.append(fmt_num(e["amount"] * w / total_w))
     if sats:
         terms.append("(" + " + ".join(sats) + ")")
     return terms
@@ -360,6 +363,8 @@ def ticket_names(board: dict) -> dict[str, str]:
     for c in board["digits"].values():
         if c:
             names[c["user_id"]] = c["name"]
+            if c.get("chop"):
+                names[c["chop"]["user_id"]] = c["chop"]["name"]
     for sp in board["sat"]["spots"]:
         if sp:
             names[sp["user_id"]] = sp["name"]
@@ -371,7 +376,18 @@ def result_text(board: dict, holder: dict | None, fireball: int) -> str:
     total = ticket_total(board)
     dc = board["digit_cost"]
     lines: list[str] = []
-    if holder:
+    if holder and holder.get("chop") and board.get("bb"):
+        bb = total * 0.9
+        a, p = holder["user_id"], holder["chop"]["user_id"]
+        each = bb / 2
+        lines.append(
+            f"🪓 **CHOP!** Congrats <@{a}> and <@{p}>, you split digit **{fireball}**. Total expected was "
+            f"{TALLY_EMOJI}**{fmt_num(total)}**; the **90% BB is taken automatically** and split down the middle: "
+            f"**{fmt_num(each)}** each.\n"
+            f"**Here's the math:**\n```\nTotal: {' + '.join(ticket_terms(board)) or '0'} = {fmt_num(total)}\n"
+            f"Buy back: {fmt_num(total)} * .9 = {fmt_num(bb)}\n"
+            f"Split two ways: {fmt_num(bb)} / 2 = {fmt_num(each)} each\n```")
+    elif holder:
         via = " (won it in the satellite 🦆)" if holder.get("via") == "satellite" else ""
         if board.get("bb"):
             bb = total * 0.9
@@ -716,6 +732,94 @@ def sip_lines(board: dict) -> str:
     return text if len(text) <= 1024 else text[:1020] + "…"
 
 
+def _ledger_entry_for_digit(board: dict, uid: str, d: int):
+    for e in board["ledger"]:
+        slots = [x for x in str(e["slot"]).split(",") if x]
+        if e["kind"] == "digit" and e["user_id"] == uid and str(d) in slots:
+            return e, slots
+    return None, []
+
+
+def movable(board: dict) -> list[tuple[str, str]]:
+    """Digits the host can move right now (claimed by a player, board still open)."""
+    if board["status"] != "open":
+        return []
+    return [(f"d{d}", f"Digit {d} · {c['name']}" + (f" 🪓 {c['chop']['name']}" if c.get("chop") else ""))
+            for d in range(10) if (c := board["digits"][str(d)]) and c.get("via") == "claim"]
+
+
+def move_digit(board: dict, src: int, dst: int) -> dict | None:
+    """Move a claim (and any chop partner) from digit src to open digit dst. Returns the claim or None."""
+    c = board["digits"][str(src)]
+    if board["status"] != "open" or not c or c.get("via") != "claim" or board["digits"][str(dst)]:
+        return None
+    e, slots = _ledger_entry_for_digit(board, c["user_id"], src)
+    if e is not None:
+        e["slot"] = ",".join(str(dst) if x == str(src) else x for x in slots)
+    for e in board["ledger"]:
+        if e["kind"] == "chop" and str(e["slot"]) == str(src):
+            e["slot"] = str(dst)
+    board["digits"][str(dst)] = c
+    board["digits"][str(src)] = None
+    return c
+
+
+def chop_share(board: dict) -> int:
+    return math.ceil(board["digit_cost"] / 2)
+
+
+def chop_offerable(board: dict, uid: str) -> list[tuple[str, str]]:
+    """Digits this player could put up for a chop: their own claims with no partner yet."""
+    if board["status"] != "open" or not board.get("bb"):
+        return []
+    return [(f"d{d}", f"Digit {d}") for d in range(10)
+            if (c := board["digits"][str(d)]) and c["user_id"] == uid and c.get("via") == "claim"
+            and not c.get("chop") and not c.get("chop_open")]
+
+
+def chop_joinable(board: dict, uid: str) -> list[tuple[str, str]]:
+    """Digits somebody else has offered for a chop that this player could join."""
+    if board["status"] != "open" or not board.get("bb"):
+        return []
+    return [(f"d{d}", f"Digit {d} · {c['name']}") for d in range(10)
+            if (c := board["digits"][str(d)]) and c.get("chop_open") and not c.get("chop") and c["user_id"] != uid]
+
+
+def offer_chop(board: dict, uid: str, d: int) -> bool:
+    c = board["digits"][str(d)]
+    if not c or c["user_id"] != uid or c.get("chop") or c.get("chop_open") or board["status"] != "open":
+        return False
+    c["chop_open"] = True
+    return True
+
+
+def join_chop(board: dict, uid: str, name: str, d: int) -> dict | None:
+    """Second player takes half of digit d: the owner's charge drops by half, the partner pays that half."""
+    c = board["digits"][str(d)]
+    if not c or not c.get("chop_open") or c.get("chop") or c["user_id"] == uid or board["status"] != "open":
+        return None
+    half = chop_share(board)
+    e, _ = _ledger_entry_for_digit(board, c["user_id"], d)
+    if e is not None:
+        e["amount"] = max(0, e["amount"] - half)
+    charge(board, uid, half, "chop", str(d))
+    c["chop"] = {"user_id": str(uid), "name": name}
+    c["chop_open"] = False
+    return c
+
+
+def digit_label(board: dict, c: dict, mention: bool = False) -> str:
+    """Owner (+ chop partner) for one claimed digit, as text or as @mentions."""
+    def who(p):
+        return f"<@{p['user_id']}>" if mention else f"**{esc(p['name'])}**"
+    text = who(c) + sip_mark(board, c["user_id"])
+    if c.get("chop"):
+        text += f" 🪓 {who(c['chop'])}{sip_mark(board, c['chop']['user_id'])}"
+    elif c.get("chop_open"):
+        text += " 🪓 *(chop open)*"
+    return text
+
+
 def releasable(board: dict) -> list[tuple[str, str]]:
     """(value, label) for every spot the host can release right now: main-board digits while the
     board is open, satellite spots while the satellite is still filling. Digits won in the
@@ -749,11 +853,13 @@ def release(board: dict, value: str) -> dict | None:
             if e["kind"] == "digit" and e["user_id"] == uid and str(n) in slots:
                 slots.remove(str(n))
                 if slots:     # an Odds/Evens claim: keep the rest of it
-                    e["amount"] -= board["digit_cost"]
+                    owner_share = board["digit_cost"] - (chop_share(board) if c.get("chop") else 0)
+                    e["amount"] = max(0, e["amount"] - owner_share)
                     e["slot"] = ",".join(slots)
                 else:
                     board["ledger"].remove(e)
                 break
+        board["ledger"] = [e for e in board["ledger"] if not (e["kind"] == "chop" and str(e["slot"]) == str(n))]
         board["digits"][str(n)] = None
         # Dropped back under 7 during the last-call countdown: the satellite isn't due anymore.
         if board.get("sat_at") and len(claimed_digits(board)) < SAT_THRESHOLD:
@@ -981,7 +1087,7 @@ def board_embed(board: dict, cfg: dict) -> discord.Embed:
         c = board["digits"][str(d)]
         if c:
             tag = " 🦆" if c.get("via") == "satellite" else ""
-            lines.append(f"`{d}`  **{esc(c['name'])}**{sip_mark(board, c['user_id'])}{tag}")
+            lines.append(f"`{d}`  {digit_label(board, c)}{tag}")
         elif status == "satellite":
             lines.append(f"`{d}`  🔒 *reserved for satellite winners*")
         else:
@@ -1055,7 +1161,7 @@ def board_panel(board: dict, cfg: dict):
         c = board["digits"][str(d)]
         if c:
             tag = " 🦆" if c.get("via") == "satellite" else ""
-            container.add_item(ui.TextDisplay(f"**{d})** <@{c['user_id']}>{sip_mark(board, c['user_id'])}{tag}"))
+            container.add_item(ui.TextDisplay(f"**{d})** {digit_label(board, c, mention=True)}{tag}"))
         elif status == "satellite":
             container.add_item(ui.TextDisplay(f"**{d})** 🔒 *reserved for satellite winners*"))
         else:
@@ -1073,6 +1179,8 @@ def board_panel(board: dict, cfg: dict):
     row.add_item(BoardButton(board["id"], "odds", "Odds", discord.ButtonStyle.secondary, not live))
     row.add_item(BoardButton(board["id"], "evens", "Evens", discord.ButtonStyle.secondary, not live))
     row.add_item(BoardButton(board["id"], "closeout", "🏁 Close", discord.ButtonStyle.danger, not live))
+    if board.get("bb"):
+        row.add_item(BoardButton(board["id"], "chop", "🪓 Chop", discord.ButtonStyle.secondary, not live))
     container.add_item(row)
     row = ui.ActionRow()
     no_sips = status == "cancelled" or not board["ledger"]
@@ -1128,7 +1236,7 @@ def sat_embed(board: dict, cfg: dict) -> discord.Embed:
     return emb
 
 
-class BoardButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fb:(?P<board>[0-9a-f]+):(?P<action>d\d|yolo|odds|evens|closeout|close|sip|remind|host|admin)"):
+class BoardButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fb:(?P<board>[0-9a-f]+):(?P<action>d\d|yolo|odds|evens|closeout|close|sip|remind|host|admin|chop)"):
     def __init__(self, board_id: str, action: str, label: str = "?", style=discord.ButtonStyle.secondary,
                  disabled: bool = False, row: int | None = None):
         super().__init__(discord.ui.Button(
@@ -1311,6 +1419,8 @@ def board_view(board: dict) -> discord.ui.View:
     view.add_item(BoardButton(board["id"], "odds", "Odds", discord.ButtonStyle.secondary, not live, row=2))
     view.add_item(BoardButton(board["id"], "evens", "Evens", discord.ButtonStyle.secondary, not live, row=2))
     view.add_item(BoardButton(board["id"], "closeout", "🏁 Close", discord.ButtonStyle.danger, not live, row=2))
+    if board.get("bb"):
+        view.add_item(BoardButton(board["id"], "chop", "🪓 Chop", discord.ButtonStyle.secondary, not live, row=2))
     no_sips = board["status"] == "cancelled" or not board["ledger"]
     view.add_item(BoardButton(board["id"], "sip", "💸 Sip", discord.ButtonStyle.success, no_sips, row=3))
     done = board["status"] == "cancelled"
@@ -1322,16 +1432,19 @@ def board_view(board: dict) -> discord.ui.View:
 class ControlPanel(discord.ui.View):
     """The private panel behind Host Controls / Admin Controls. Every button re-checks who's pressing."""
 
-    def __init__(self, cog, board_id: str, admin: bool):
+    def __init__(self, cog, board_id: str, admin: bool, bb_on: bool = True):
         super().__init__(timeout=600)
         self.cog, self.board_id = cog, board_id
         buttons = [
             ("🔓 Release Spot", discord.ButtonStyle.primary, self.cog.panel_release),
+            ("↔️ Move Player", discord.ButtonStyle.primary, self.cog.panel_move),
             ("✅ Force Sip", discord.ButtonStyle.primary, self.cog.panel_force_sip),
             ("🔔 Remind Sips", discord.ButtonStyle.secondary, self.cog._remind_sips),
             ("📋 Expected Sips", discord.ButtonStyle.secondary, self.cog.panel_expected),
             ("🔒 Close Board", discord.ButtonStyle.danger, self.cog.panel_close),
         ]
+        if not bb_on:
+            buttons.append(("💰 Enable 90% BB", discord.ButtonStyle.success, self.cog.panel_enable_bb))
         if admin:
             buttons.append(("🛑 Cancel Board", discord.ButtonStyle.danger, self.cog.panel_cancel))
         for label, style, handler in buttons:
@@ -1677,6 +1790,9 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         if action in ("host", "admin"):
             await self._open_panel(interaction, board_id, admin=action == "admin")
             return
+        if action == "chop":
+            await self._chop(interaction, board_id)
+            return
         user = interaction.user
         opened_sat = filled = False
         reply = ""
@@ -1927,6 +2043,36 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                               f"Send the host your {TALLY_EMOJI}, then tap **💸 Sip** on the board (or type `sip`).\n"
                               f"{pay_line(host_pay)}")
 
+    async def _auto_chop_bb(self, board_id: str):
+        """A chopped digit hit: take the 90% BB for both players and tell the host where to send each half."""
+        async with self.store.lock:
+            b = self.store.data["boards"].get(board_id)
+            if not b or b.get("bb_taken"):
+                return
+            holder = b["digits"][str(b["result"]["fireball"])]
+            b["bb_taken"] = True
+            self.store.save()
+            snap = json.loads(json.dumps(b))
+            pays = {uid: get_pay(self.store.data, uid) for uid in (holder["user_id"], holder["chop"]["user_id"])}
+        each = ticket_total(snap) * 0.9 / 2
+        lines = [f"🪓 **Chop payout** on 🔥 Fireball {esc(snap.get('code') or '')} ({draw_title(snap)}): "
+                 f"digit **{snap['result']['fireball']}** hit and the 90% BB was taken automatically. "
+                 f"Send {TALLY_EMOJI}**{fmt_num(each)}** to each:"]
+        for p in (holder, holder["chop"]):
+            uid = p["user_id"]
+            sip = "" if has_sipped(snap, uid) else " ⚠️ never sipped"
+            lines.append(f"• **{esc(p['name'])}** (<@{uid}>){sip}: " + (pays[uid] or "*no pay info saved (`/payinfo set`)*"))
+        request = "\n".join(lines)
+        try:
+            host = self.bot.get_user(int(snap["host_id"])) or await self.bot.fetch_user(int(snap["host_id"]))
+            await host.send(request)
+            note = "The host has been sent both players' pay info."
+        except (discord.HTTPException, ValueError):
+            await self._say(snap, f"<@{snap['host_id']}> {request}")
+            note = ""
+        await self._say(snap, f"💰 90% BB taken automatically for the chop: {TALLY_EMOJI}**{fmt_num(each)}** each. {note}".strip(),
+                        allowed_mentions=discord.AllowedMentions.none())
+
     async def on_bb_click(self, interaction: discord.Interaction, board_id: str):
         """Winner takes the 90% buyback: the host gets a DM with the winner's pay info and what they owe."""
         async with self.store.lock:
@@ -2009,6 +2155,65 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             except discord.HTTPException:
                 pass
 
+    async def _chop(self, interaction: discord.Interaction, board_id: str):
+        """🪓 on a 90% BB board: offer one of your digits for a chop, or join one somebody else offered."""
+        user = interaction.user
+        uid = str(user.id)
+        async with self.store.lock:
+            board = self.store.data["boards"].get(board_id)
+            if not board or board["status"] != "open" or not board.get("bb"):
+                await interaction.response.send_message("Chops are only open on a live 90% BB board.", ephemeral=True)
+                return
+            if not host_may_play(self.store.data, board, user):
+                await interaction.response.send_message(HOST_NO_PLAY, ephemeral=True)
+                return
+            joinable = chop_joinable(board, uid)
+            offerable = chop_offerable(board, uid)
+            half = chop_share(board)
+        if not joinable and not offerable:
+            await interaction.response.send_message(
+                "Nothing to chop: nobody's offering a digit, and you don't hold one you could offer.", ephemeral=True)
+            return
+
+        async def picked(inter: discord.Interaction, value: str):
+            d = int(value[1:])
+            async with self.store.lock:
+                b = self.store.data["boards"].get(board_id)
+                if not b:
+                    await inter.response.edit_message(content="This board is gone.", view=None)
+                    return
+                c = b["digits"][str(d)]
+                if c and c["user_id"] == uid:
+                    ok = offer_chop(b, uid, d)
+                    if not ok:
+                        await inter.response.edit_message(content="That digit can't be offered anymore.", view=None)
+                        return
+                    self.store.save()
+                    snap = json.loads(json.dumps(b))
+                    await inter.response.edit_message(content=f"🪓 Digit **{d}** is up for a chop.", view=None)
+                    await self._say(snap, f"🪓 <@{uid}> is offering to chop digit **{d}**: tap **🪓 Chop** to go halves "
+                                          f"({TALLY_EMOJI}**{half}** each). If it hits, the 90% BB is taken and split evenly.",
+                                    allowed_mentions=discord.AllowedMentions.none())
+                else:
+                    c = join_chop(b, uid, user.display_name, d)
+                    if c is None:
+                        await inter.response.edit_message(content="That chop isn't open anymore.", view=None)
+                        return
+                    self.store.save()
+                    snap = json.loads(json.dumps(b))
+                    await inter.response.edit_message(
+                        content=f"🪓 You're in on digit **{d}** with **{esc(c['name'])}** for {TALLY_EMOJI}**{half}**. "
+                                f"You're in for {TALLY_EMOJI}**{owed(b, uid)}** on this game.", view=None)
+                    await self._say(snap, f"🪓 **Chop!** <@{uid}> joined <@{c['user_id']}> on digit **{d}**. "
+                                          f"If **{d}** hits, the 90% BB is taken automatically and split down the middle.",
+                                    allowed_mentions=discord.AllowedMentions.none())
+            await self._refresh(board_id)
+
+        options = [(v, f"Join: {lab}") for v, lab in joinable] + [(v, f"Offer my {lab}") for v, lab in offerable]
+        await interaction.response.send_message(
+            f"🪓 **Chop a digit.** Join a chop someone offered, or offer one of yours. Each half costs {TALLY_EMOJI}**{half}**.",
+            view=pick_view(options, "Pick a digit", picked), ephemeral=True)
+
     async def _panel_board(self, interaction: discord.Interaction, board_id: str) -> dict | None:
         """Snapshot of the board if the presser may use host controls on it; otherwise answers them and returns None."""
         async with self.store.lock:
@@ -2034,7 +2239,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             return
         title = "🛡️ **Admin Controls**" if admin else "🛠️ **Host Controls**"
         await interaction.response.send_message(
-            f"{title} for Fireball {esc(snap.get('code') or '')}", view=ControlPanel(self, board_id, admin), ephemeral=True)
+            f"{title} for Fireball {esc(snap.get('code') or '')}", view=ControlPanel(self, board_id, admin, bb_on=bool(snap.get("bb"))), ephemeral=True)
 
     async def panel_release(self, interaction: discord.Interaction, board_id: str):
         snap = await self._panel_board(interaction, board_id)
@@ -2072,6 +2277,70 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
 
         await interaction.response.send_message(
             "Which spot do you want to release?", view=pick_view(options, "Pick a spot", picked), ephemeral=True)
+
+    async def panel_move(self, interaction: discord.Interaction, board_id: str):
+        snap = await self._panel_board(interaction, board_id)
+        if not snap:
+            return
+        options = movable(snap)
+        if not options:
+            await interaction.response.send_message("Nothing to move: digits can only be moved while the board is open.", ephemeral=True)
+            return
+
+        async def picked_src(inter: discord.Interaction, value: str):
+            src = int(value[1:])
+            async with self.store.lock:
+                b = self.store.data["boards"].get(board_id)
+                free = open_digits(b) if b else []
+            if not free:
+                await inter.response.edit_message(content="There's no open digit to move them to.", view=None)
+                return
+
+            async def picked_dst(inter2: discord.Interaction, value2: str):
+                dst = int(value2[1:])
+                async with self.store.lock:
+                    b2 = self.store.data["boards"].get(board_id)
+                    if not b2 or not can_host(inter2, b2):
+                        await inter2.response.send_message("You can't do that.", ephemeral=True)
+                        return
+                    c = move_digit(b2, src, dst)
+                    if c is None:
+                        await inter2.response.edit_message(content="That move isn't possible anymore.", view=None)
+                        return
+                    self.store.save()
+                    s = json.loads(json.dumps(b2))
+                await inter2.response.edit_message(content=f"↔️ Moved **{esc(c['name'])}** from digit **{src}** to **{dst}**.", view=None)
+                await self._say(s, f"↔️ {esc(inter2.user.display_name)} moved <@{c['user_id']}> from digit **{src}** to digit **{dst}**.",
+                                allowed_mentions=discord.AllowedMentions.none())
+                await self._refresh(board_id)
+
+            await inter.response.edit_message(
+                content=f"Move digit **{src}** to which open digit?",
+                view=pick_view([(f"d{d}", f"Digit {d}") for d in free], "Pick the new digit", picked_dst))
+
+        await interaction.response.send_message(
+            "Which player's digit do you want to move?", view=pick_view(options, "Pick a digit", picked_src), ephemeral=True)
+
+    async def panel_enable_bb(self, interaction: discord.Interaction, board_id: str):
+        snap = await self._panel_board(interaction, board_id)
+        if not snap:
+            return
+        async with self.store.lock:
+            b = self.store.data["boards"].get(board_id)
+            if not b or b["status"] not in ACTIVE_STATUSES + ("locked",):
+                await interaction.response.send_message("This game can't be changed anymore.", ephemeral=True)
+                return
+            if b.get("bb"):
+                await interaction.response.send_message("90% BB is already on. It can't be turned off.", ephemeral=True)
+                return
+            b["bb"] = True
+            self.store.save()
+            s = json.loads(json.dumps(b))
+        await interaction.response.send_message("💰 90% BB is now on for this game. It can't be switched back off.", ephemeral=True)
+        await self._say(s, f"💰 **{esc(interaction.user.display_name)} turned on 90% BB** for Fireball {esc(s.get('code') or '')}. "
+                           f"The winner can take the buyback, and digits can now be chopped with the 🪓 button.",
+                        allowed_mentions=discord.AllowedMentions.none())
+        await self._refresh(board_id)
 
     async def panel_force_sip(self, interaction: discord.Interaction, board_id: str):
         snap = await self._panel_board(interaction, board_id)
@@ -2513,8 +2782,11 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         emb.add_field(name="Link", value=RESULTS_URL, inline=False)
         emb.set_footer(text=f"{date.fromisoformat(snap['draw_date']).strftime('%A %b %d, %Y').replace(' 0', ' ')} ({snap['draw'].title()})")
         text = result_text(snap, holder, fireball)
-        extra = {"view": bb_view(board_id)} if holder and snap.get("bb") else {}
+        chopped = bool(holder and holder.get("chop") and snap.get("bb"))
+        extra = {"view": bb_view(board_id)} if holder and snap.get("bb") and not chopped else {}
         msg = await self._say(snap, text, embed=emb, **extra)
+        if chopped:
+            await self._auto_chop_bb(board_id)
         async with self.store.lock:
             b = self.store.data["boards"].get(board_id)
             if b and msg:
