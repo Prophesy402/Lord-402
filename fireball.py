@@ -804,8 +804,8 @@ def chop_joinable(board: dict, uid: str) -> list[tuple[str, str]]:
     """Digits somebody else has offered for a chop that this player could join."""
     if board["status"] != "open" or not board.get("bb"):
         return []
-    return [(f"d{d}", f"Digit {d} · {c['name']}") for d in range(10)
-            if (c := board["digits"][str(d)]) and c.get("chop_open") and not c.get("chop") and c["user_id"] != uid]
+    return [(f"d{d}", f"Digit {d} · {'your' if c['user_id'] == uid else c['name']}") for d in range(10)
+            if (c := board["digits"][str(d)]) and c.get("chop_open") and not c.get("chop")]
 
 
 def offer_chop(board: dict, uid: str, d: int) -> bool:
@@ -819,9 +819,16 @@ def offer_chop(board: dict, uid: str, d: int) -> bool:
 def join_chop(board: dict, uid: str, name: str, d: int) -> dict | None:
     """Second player takes the other half of digit d and pays what's left of the digit price."""
     c = board["digits"][str(d)]
-    if not c or not c.get("chop_open") or c.get("chop") or c["user_id"] == uid or board["status"] != "open":
+    if not c or not c.get("chop_open") or c.get("chop") or board["status"] != "open":
         return None
     dc = board["digit_cost"]
+    if c["user_id"] == str(uid):     # taking your own other half: it's just a whole digit again
+        rest = max(0, dc - c.get("paid", dc - chop_share(board)))
+        if rest:
+            charge(board, uid, rest, "digit", str(d))
+        c["chop_open"] = False
+        c.pop("paid", None)
+        return c
     if "paid" not in c:      # an offered full digit: owner drops to half, partner pays the rest
         half = chop_share(board)
         e, _ = _ledger_entry_for_digit(board, c["user_id"], d)
@@ -2251,8 +2258,15 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                                         f"to grab it for {TALLY_EMOJI}**{b['digit_cost'] - half}**. If it hits, the 90% BB is split evenly.")
                     else:
                         done.append(f"digit **{d}** was just taken")
-                elif c["user_id"] == uid:
+                elif c["user_id"] == uid and not c.get("chop_open"):
                     done.append(f"you already hold digit **{d}**")
+                elif c["user_id"] == uid:
+                    before = owed(b, uid)
+                    if join_chop(b, uid, user.display_name, d) is not None:
+                        done.append(f"🪓 took the other half of digit **{d}** for {TALLY_EMOJI}**{owed(b, uid) - before}**; it's all yours now")
+                        announce.append(f"🪓 <@{uid}> took the other half of digit **{d}** too. It's a whole digit now.")
+                    else:
+                        done.append(f"digit **{d}** couldn't be completed")
                 else:
                     c = join_chop(b, uid, user.display_name, d)
                     if c is not None:
