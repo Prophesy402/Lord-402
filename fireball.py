@@ -1458,6 +1458,22 @@ class ControlPanel(discord.ui.View):
         return cb
 
 
+class ChopModal(discord.ui.Modal, title="Chop Spot(s)"):
+    """The 🪓 form: one dropdown of chops you can join and digits of yours you can offer."""
+
+    def __init__(self, cog, board_id: str, options: list[discord.SelectOption], half: int):
+        super().__init__(timeout=300)
+        self.cog, self.board_id = cog, board_id
+        self.pick = discord.ui.Select(placeholder="Make a selection", min_values=1,
+                                      max_values=len(options), options=options)
+        self.add_item(discord.ui.Label(text="Select Spot(s) to Chop",
+                                       description=f"Each half of a chopped digit costs {half}. Pick as many as you like.",
+                                       component=self.pick))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.cog._apply_chops(interaction, self.board_id, list(self.pick.values))
+
+
 class PickSelect(discord.ui.Select):
     """A one-shot private dropdown (which spot to release / whose sip to force)."""
 
@@ -2156,7 +2172,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 pass
 
     async def _chop(self, interaction: discord.Interaction, board_id: str):
-        """🪓 on a 90% BB board: offer one of your digits for a chop, or join one somebody else offered."""
+        """🪓 on a 90% BB board: a form with a dropdown of chops to join and your own digits to offer."""
         user = interaction.user
         uid = str(user.id)
         async with self.store.lock:
@@ -2174,45 +2190,50 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             await interaction.response.send_message(
                 "Nothing to chop: nobody's offering a digit, and you don't hold one you could offer.", ephemeral=True)
             return
+        options = [discord.SelectOption(label=f"Join {lab}", value=v, emoji="🤝",
+                                        description=f"Go halves for {half} each") for v, lab in joinable]
+        options += [discord.SelectOption(label=f"Offer my {lab}", value=v, emoji="🪓",
+                                         description="Put it up; someone else can join") for v, lab in offerable]
+        await interaction.response.send_modal(ChopModal(self, board_id, options[:25], half))
 
-        async def picked(inter: discord.Interaction, value: str):
-            d = int(value[1:])
-            async with self.store.lock:
-                b = self.store.data["boards"].get(board_id)
-                if not b:
-                    await inter.response.edit_message(content="This board is gone.", view=None)
-                    return
+    async def _apply_chops(self, interaction: discord.Interaction, board_id: str, values: list[str]):
+        """Modal submit: offer and/or join each picked digit, then report back."""
+        user = interaction.user
+        uid = str(user.id)
+        done: list[str] = []
+        announce: list[str] = []
+        async with self.store.lock:
+            b = self.store.data["boards"].get(board_id)
+            if not b or b["status"] != "open" or not b.get("bb"):
+                await interaction.response.send_message("That board isn't taking chops anymore.", ephemeral=True)
+                return
+            half = chop_share(b)
+            for value in values:
+                d = int(value[1:])
                 c = b["digits"][str(d)]
                 if c and c["user_id"] == uid:
-                    ok = offer_chop(b, uid, d)
-                    if not ok:
-                        await inter.response.edit_message(content="That digit can't be offered anymore.", view=None)
-                        return
-                    self.store.save()
-                    snap = json.loads(json.dumps(b))
-                    await inter.response.edit_message(content=f"🪓 Digit **{d}** is up for a chop.", view=None)
-                    await self._say(snap, f"🪓 <@{uid}> is offering to chop digit **{d}**: tap **🪓 Chop** to go halves "
-                                          f"({TALLY_EMOJI}**{half}** each). If it hits, the 90% BB is taken and split evenly.",
-                                    allowed_mentions=discord.AllowedMentions.none())
+                    if offer_chop(b, uid, d):
+                        done.append(f"🪓 offered digit **{d}**")
+                        announce.append(f"🪓 <@{uid}> is offering to chop digit **{d}**: tap **🪓 Chop** to go halves "
+                                        f"({TALLY_EMOJI}**{half}** each). If it hits, the 90% BB is taken and split evenly.")
+                    else:
+                        done.append(f"digit **{d}** couldn't be offered")
                 else:
                     c = join_chop(b, uid, user.display_name, d)
-                    if c is None:
-                        await inter.response.edit_message(content="That chop isn't open anymore.", view=None)
-                        return
-                    self.store.save()
-                    snap = json.loads(json.dumps(b))
-                    await inter.response.edit_message(
-                        content=f"🪓 You're in on digit **{d}** with **{esc(c['name'])}** for {TALLY_EMOJI}**{half}**. "
-                                f"You're in for {TALLY_EMOJI}**{owed(b, uid)}** on this game.", view=None)
-                    await self._say(snap, f"🪓 **Chop!** <@{uid}> joined <@{c['user_id']}> on digit **{d}**. "
-                                          f"If **{d}** hits, the 90% BB is taken automatically and split down the middle.",
-                                    allowed_mentions=discord.AllowedMentions.none())
-            await self._refresh(board_id)
-
-        options = [(v, f"Join: {lab}") for v, lab in joinable] + [(v, f"Offer my {lab}") for v, lab in offerable]
+                    if c is not None:
+                        done.append(f"🤝 joined **{esc(c['name'])}** on digit **{d}** for {TALLY_EMOJI}**{half}**")
+                        announce.append(f"🪓 **Chop!** <@{uid}> joined <@{c['user_id']}> on digit **{d}**. "
+                                        f"If **{d}** hits, the 90% BB is taken automatically and split down the middle.")
+                    else:
+                        done.append(f"the chop on digit **{d}** wasn't open anymore")
+            self.store.save()
+            total = owed(b, uid)
+            snap = json.loads(json.dumps(b))
         await interaction.response.send_message(
-            f"🪓 **Chop a digit.** Join a chop someone offered, or offer one of yours. Each half costs {TALLY_EMOJI}**{half}**.",
-            view=pick_view(options, "Pick a digit", picked), ephemeral=True)
+            "\n".join(done) + f"\nYou're in for {TALLY_EMOJI}**{total}** on this game.", ephemeral=True)
+        for line in announce:
+            await self._say(snap, line, allowed_mentions=discord.AllowedMentions.none())
+        await self._refresh(board_id)
 
     async def _panel_board(self, interaction: discord.Interaction, board_id: str) -> dict | None:
         """Snapshot of the board if the presser may use host controls on it; otherwise answers them and returns None."""
