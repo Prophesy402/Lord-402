@@ -200,6 +200,27 @@ THEMES["halloween2"] = dict(
         "The pumpkin's lit, the ducks are lit, your mom's lit. Big night.",
     ],
 )
+# Third Halloween look: slasher night.
+THEMES["halloween3"] = dict(
+    THEMES["halloween"],
+    label="Halloween Slasher Night 🔪",
+    banner="halloween3_banner.jpg",
+    colors={"open": 0xB71C1C, "satellite": 0x4A148C, "animating": 0x7F0000,
+            "locked": 0x263238, "settled": 0x7CB342, "cancelled": 0x212121},
+    sat_title="🔪🦆 Fireball Satellite · Camp Quackalake",
+    open_line="🔪 **Fireball {code} is open.** Lock your doors, pick your digit.",
+    spin="🔪 **Sharpening the lineup...**",
+    race="🔪🔥 **THE DUCKS ARE BEING HUNTED** 🔥🔪",
+    race_quip="*Don't go in the pond. Quack chaos!*",
+    settled="🔪 **The screaming stopped. Burnin' happy!** The ducks that made it to morning:",
+    congrats="🏆 FINAL DUCK! Congrats",
+    lines=THEMES["halloween"]["lines"] + [
+        "Hockey masks and feathers. What a night.",
+        "The call is coming from inside the pond.",
+        "One, two, Steve's coming for you. Three, four, sip a little more.",
+        "Every horror movie starts with someone saying 'it's probably nothing.' Your digit is probably nothing.",
+    ],
+)
 _theme_by_guild: dict[str, str] = {}     # filled from the saved config when the cog loads
 
 
@@ -2713,6 +2734,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
     @app_commands.choices(look=[app_commands.Choice(name="Normal 🔥", value="normal"),
                                 app_commands.Choice(name="Halloween 🎃", value="halloween"),
                                 app_commands.Choice(name="Halloween After Dark 🎃🔥", value="halloween2"),
+                                app_commands.Choice(name="Halloween Slasher Night 🔪", value="halloween3"),
                                 app_commands.Choice(name="Husker Volleyball 🏐", value="husker")])
     async def theme_cmd(self, interaction: discord.Interaction, look: app_commands.Choice[str] | None = None):
         if not is_admin(interaction):
