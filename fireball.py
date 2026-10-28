@@ -517,10 +517,12 @@ def claim_digits(data: dict, board: dict, user_id: str, name: str, requested: li
     for d in avail:
         board["digits"][str(d)] = {"user_id": str(user_id), "name": name, "via": "claim"}
     opened = full = False
-    if len(claimed_digits(board)) == 10:      # main board closed out: no satellite needed
+    if len(claimed_digits(board)) == 10 and not half_open_digits(board):   # closed out: no satellite needed
         board["sat_at"] = None
         board["status"] = "locked"
         full = True
+    elif len(claimed_digits(board)) == 10:                                  # full, but a chop is still half open
+        board["sat_at"] = None
     elif not pending and len(claimed_digits(board)) >= SAT_THRESHOLD:
         board["sat_at"] = (datetime.now(timezone.utc) + timedelta(seconds=SAT_DELAY)).isoformat()
         opened = True      # means: the grace window just started
@@ -542,6 +544,8 @@ def open_satellite(board: dict) -> str | None:
     board["sat_at"] = None
     left = open_digits(board)
     if not left:
+        if half_open_digits(board):
+            return "half"          # stays open so the other half of a chop can still be taken
         board["status"] = "locked"
         return "full"
     board["status"] = "satellite"
@@ -768,6 +772,20 @@ def chop_share(board: dict) -> int:
     return math.ceil(board["digit_cost"] / 2)
 
 
+def half_open_digits(board: dict) -> list[int]:
+    return [d for d in range(10) if (c := board["digits"][str(d)]) and c.get("chop_open") and not c.get("chop")]
+
+
+def close_out_if_full(board: dict) -> bool:
+    """All ten digits whole and claimed: nothing left to sell, so claims close now. Half-open digits keep it open."""
+    if board["status"] in ("open", "satellite") and len(claimed_digits(board)) == 10 and not half_open_digits(board) \
+            and not (board["status"] == "satellite" and not all(board["sat"]["spots"]) and board["sat"]["reserved"]):
+        board["sat_at"] = None
+        board["status"] = "locked"
+        return True
+    return False
+
+
 def chop_takeable(board: dict) -> list[tuple[str, str]]:
     """Open digits: a player can take half of one and leave the other half up for grabs."""
     if board["status"] != "open" or not board.get("bb"):
@@ -801,8 +819,8 @@ def settle_open_chops(board: dict) -> list[int]:
 
 
 def chop_joinable(board: dict, uid: str) -> list[tuple[str, str]]:
-    """Digits somebody else has offered for a chop that this player could join."""
-    if board["status"] != "open" or not board.get("bb"):
+    """Half-open digits this player could complete (their own) or join (someone else's)."""
+    if board["status"] not in ("open", "satellite") or not board.get("bb"):
         return []
     return [(f"d{d}", f"Digit {d} · {'your' if c['user_id'] == uid else c['name']}") for d in range(10)
             if (c := board["digits"][str(d)]) and c.get("chop_open") and not c.get("chop")]
@@ -819,7 +837,7 @@ def offer_chop(board: dict, uid: str, d: int) -> bool:
 def join_chop(board: dict, uid: str, name: str, d: int) -> dict | None:
     """Second player takes the other half of digit d and pays what's left of the digit price."""
     c = board["digits"][str(d)]
-    if not c or not c.get("chop_open") or c.get("chop") or board["status"] != "open":
+    if not c or not c.get("chop_open") or c.get("chop") or board["status"] not in ("open", "satellite"):
         return None
     dc = board["digit_cost"]
     if c["user_id"] == str(uid):     # taking your own other half: it's just a whole digit again
@@ -1207,7 +1225,7 @@ def board_panel(board: dict, cfg: dict):
         if c:
             tag = " 🦆" if c.get("via") == "satellite" else ""
             line = f"**{d})** {digit_label(board, c, mention=True)}{tag}"
-            if c.get("chop_open") and not c.get("chop") and live and board.get("bb") and budget >= 2:
+            if c.get("chop_open") and not c.get("chop") and status in ("open", "satellite") and board.get("bb") and budget >= 2:
                 budget -= 2
                 # half-open digit: a button right on the row to grab the other half (owner = take it all)
                 container.add_item(ui.Section(
@@ -1921,6 +1939,11 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 await self._say(snapshot, f"🔒 **Fireball board closed** by {esc(user.display_name)}. {closed_note}".strip())
                 await self._tag(snapshot, "CLOSED")
             await self._retire_sat(snapshot)
+        if not filled and not opened_sat and len(claimed_digits(snapshot)) == 10 and half_open_digits(snapshot) \
+                and snapshot["status"] == "open" and action.startswith(("d", "yolo", "odds", "evens")):
+            ho = ", ".join(str(d) for d in half_open_digits(snapshot))
+            await self._say(snapshot, f"🪓 Every digit is taken, but digit {ho} is still half open. The other half can be "
+                                      f"chopped until claims close {ts(snapshot['lock_at'], 'R')}.")
         if filled:
             await self._say(snapshot, f"🏁 **{esc(user.display_name)} closed out the board!** All 10 digits are claimed, "
                                       f"so there's no satellite. Draw at {ts(snapshot['draw_at'], 't')}.")
@@ -2233,7 +2256,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         uid = str(user.id)
         async with self.store.lock:
             board = self.store.data["boards"].get(board_id)
-            if not board or board["status"] != "open" or not board.get("bb"):
+            if not board or board["status"] not in ("open", "satellite") or not board.get("bb"):
                 await interaction.response.send_message("Chops are only open on a live 90% BB board.", ephemeral=True)
                 return
             if not host_may_play(self.store.data, board, user):
@@ -2258,7 +2281,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         uid = str(user.id)
         async with self.store.lock:
             b = self.store.data["boards"].get(board_id)
-            if not b or b["status"] != "open" or not b.get("bb"):
+            if not b or b["status"] not in ("open", "satellite") or not b.get("bb"):
                 await interaction.response.send_message("That digit isn't open for a chop anymore.", ephemeral=True)
                 return
             if not host_may_play(self.store.data, b, user):
@@ -2274,6 +2297,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             if c is None:
                 await interaction.response.send_message("That half's already gone.", ephemeral=True)
                 return
+            closed = close_out_if_full(b)
             self.store.save()
             paid = owed(b, uid) - before
             snap = json.loads(json.dumps(b))
@@ -2291,6 +2315,13 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                                   f"If **{d}** hits, the 90% BB is taken automatically and split down the middle.",
                             allowed_mentions=discord.AllowedMentions.none())
         await self._refresh(board_id)
+        if closed:
+            await self._announce_closed_out(snap)
+
+    async def _announce_closed_out(self, snap: dict):
+        await self._say(snap, f"🏁 **The board is full!** Every digit is spoken for, so claims are closed. "
+                              f"Draw at {ts(snap['draw_at'], 't')}; the result posts automatically.")
+        await self._tag(snap, "CLOSED")
 
     async def _apply_chops(self, interaction: discord.Interaction, board_id: str, values: list[str]):
         """Modal submit: offer and/or join each picked digit, then report back."""
@@ -2300,7 +2331,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         announce: list[str] = []
         async with self.store.lock:
             b = self.store.data["boards"].get(board_id)
-            if not b or b["status"] != "open" or not b.get("bb"):
+            if not b or b["status"] not in ("open", "satellite") or not b.get("bb"):
                 await interaction.response.send_message("That board isn't taking chops anymore.", ephemeral=True)
                 return
             half = chop_share(b)
@@ -2331,6 +2362,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                                         f"If **{d}** hits, the 90% BB is taken automatically and split down the middle.")
                     else:
                         done.append(f"the chop on digit **{d}** wasn't open anymore")
+            closed = close_out_if_full(b)
             self.store.save()
             total = owed(b, uid)
             snap = json.loads(json.dumps(b))
@@ -2339,6 +2371,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         for line in announce:
             await self._say(snap, line, allowed_mentions=discord.AllowedMentions.none())
         await self._refresh(board_id)
+        if closed:
+            await self._announce_closed_out(snap)
 
     async def _panel_board(self, interaction: discord.Interaction, board_id: str) -> dict | None:
         """Snapshot of the board if the presser may use host controls on it; otherwise answers them and returns None."""
@@ -2605,6 +2639,11 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         if result == "full":
             await self._say(snap, "🔒 **All ten digits were claimed during the countdown, so there's no satellite.** "
                                   f"The board is full. Draw at {ts(snap['draw_at'], 't')}.")
+            return
+        if result == "half":
+            ho = ", ".join(str(d) for d in half_open_digits(snap))
+            await self._say(snap, f"🪓 **Every digit is taken, but digit {ho} is still half open.** No satellite needed; "
+                                  f"the other half can be chopped until claims close {ts(snap['lock_at'], 'R')}.")
             return
         await self._post_satellite(board_id)
 
