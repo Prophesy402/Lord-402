@@ -1186,6 +1186,11 @@ def board_panel(board: dict, cfg: dict):
     live = status == "open"
     color = th["colors"].get(status, th["colors"]["open"])
     container = ui.Container(accent_color=discord.Color(color))
+    # Discord allows 40 components per message. Fixed parts + 10 digit rows (open digit = row + button)
+    # + the two button rows; what's left pays for inline "other half" buttons (2 each).
+    fixed = 1 + 1 + 2 + 1 + 1 + 2 + 7 + (1 if board.get("bb") else 0) + (2 if (banner := theme(board).get("banner")) and Path(__file__).with_name(banner).exists() else 0)
+    digit_rows = sum(2 if not board["digits"][str(d)] and status != "satellite" else 1 for d in range(10))
+    budget = 40 - fixed - digit_rows
     files: list[discord.File] = []
     banner = th.get("banner")
     if banner and Path(__file__).with_name(banner).exists():
@@ -1201,7 +1206,15 @@ def board_panel(board: dict, cfg: dict):
         c = board["digits"][str(d)]
         if c:
             tag = " 🦆" if c.get("via") == "satellite" else ""
-            container.add_item(ui.TextDisplay(f"**{d})** {digit_label(board, c, mention=True)}{tag}"))
+            line = f"**{d})** {digit_label(board, c, mention=True)}{tag}"
+            if c.get("chop_open") and not c.get("chop") and live and board.get("bb") and budget >= 2:
+                budget -= 2
+                # half-open digit: a button right on the row to grab the other half (owner = take it all)
+                container.add_item(ui.Section(
+                    ui.TextDisplay(line),
+                    accessory=BoardButton(board["id"], f"full{d}", "🪓 Other half", discord.ButtonStyle.secondary, False)))
+            else:
+                container.add_item(ui.TextDisplay(line))
         elif status == "satellite":
             container.add_item(ui.TextDisplay(f"**{d})** 🔒 *reserved for satellite winners*"))
         else:
@@ -1276,7 +1289,7 @@ def sat_embed(board: dict, cfg: dict) -> discord.Embed:
     return emb
 
 
-class BoardButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fb:(?P<board>[0-9a-f]+):(?P<action>d\d|yolo|odds|evens|closeout|close|sip|remind|host|admin|chop)"):
+class BoardButton(discord.ui.DynamicItem[discord.ui.Button], template=r"fb:(?P<board>[0-9a-f]+):(?P<action>d\d|full\d|yolo|odds|evens|closeout|close|sip|remind|host|admin|chop)"):
     def __init__(self, board_id: str, action: str, label: str = "?", style=discord.ButtonStyle.secondary,
                  disabled: bool = False, row: int | None = None):
         super().__init__(discord.ui.Button(
@@ -1849,6 +1862,9 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         if action == "chop":
             await self._chop(interaction, board_id)
             return
+        if action.startswith("full"):
+            await self._take_other_half(interaction, board_id, int(action[4:]))
+            return
         user = interaction.user
         opened_sat = filled = False
         reply = ""
@@ -2235,6 +2251,46 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         options += [discord.SelectOption(label=f"{lab} · half", value=v, emoji="🪓",
                                          description=f"Take half for {half}; the other half stays open") for v, lab in takeable]
         await interaction.response.send_modal(ChopModal(self, board_id, options[:25], half))
+
+    async def _take_other_half(self, interaction: discord.Interaction, board_id: str, d: int):
+        """The row button on a half-open digit: owner takes it all, anyone else joins the chop."""
+        user = interaction.user
+        uid = str(user.id)
+        async with self.store.lock:
+            b = self.store.data["boards"].get(board_id)
+            if not b or b["status"] != "open" or not b.get("bb"):
+                await interaction.response.send_message("That digit isn't open for a chop anymore.", ephemeral=True)
+                return
+            if not host_may_play(self.store.data, b, user):
+                await interaction.response.send_message(HOST_NO_PLAY, ephemeral=True)
+                return
+            c = b["digits"][str(d)]
+            if not c or not c.get("chop_open") or c.get("chop"):
+                await interaction.response.send_message("That half's already gone.", ephemeral=True)
+                return
+            mine = c["user_id"] == uid
+            before = owed(b, uid)
+            c = join_chop(b, uid, user.display_name, d)
+            if c is None:
+                await interaction.response.send_message("That half's already gone.", ephemeral=True)
+                return
+            self.store.save()
+            paid = owed(b, uid) - before
+            snap = json.loads(json.dumps(b))
+        if mine:
+            await interaction.response.send_message(
+                f"🪓 Digit **{d}** is all yours now ({TALLY_EMOJI}**{paid}** for the other half). "
+                f"You're in for {TALLY_EMOJI}**{owed(snap, uid)}** on this game.", ephemeral=True)
+            await self._say(snap, f"🪓 <@{uid}> took the other half of digit **{d}** too. It's a whole digit now.",
+                            allowed_mentions=discord.AllowedMentions.none())
+        else:
+            await interaction.response.send_message(
+                f"🤝 You're in on digit **{d}** with **{esc(c['name'])}** for {TALLY_EMOJI}**{paid}**. "
+                f"You're in for {TALLY_EMOJI}**{owed(snap, uid)}** on this game.", ephemeral=True)
+            await self._say(snap, f"🪓 **Chop!** <@{uid}> joined <@{c['user_id']}> on digit **{d}**. "
+                                  f"If **{d}** hits, the 90% BB is taken automatically and split down the middle.",
+                            allowed_mentions=discord.AllowedMentions.none())
+        await self._refresh(board_id)
 
     async def _apply_chops(self, interaction: discord.Interaction, board_id: str, values: list[str]):
         """Modal submit: offer and/or join each picked digit, then report back."""
