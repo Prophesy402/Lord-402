@@ -345,7 +345,7 @@ def ticket_terms(board: dict) -> list[str]:
         else:
             slots = [x for x in str(e["slot"]).split(",") if x] or [""]
             dc, half = board["digit_cost"], chop_share(board)
-            weights = [dc - half if (c := board["digits"].get(x)) and c.get("chop") else dc for x in slots]
+            weights = [c.get("paid", dc - half) if (c := board["digits"].get(x)) and c.get("chop") else dc for x in slots]
             total_w = sum(weights) or 1
             for w in weights:
                 terms.append(fmt_num(e["amount"] * w / total_w))
@@ -768,13 +768,36 @@ def chop_share(board: dict) -> int:
     return math.ceil(board["digit_cost"] / 2)
 
 
-def chop_offerable(board: dict, uid: str) -> list[tuple[str, str]]:
-    """Digits this player could put up for a chop: their own claims with no partner yet."""
+def chop_takeable(board: dict) -> list[tuple[str, str]]:
+    """Open digits: a player can take half of one and leave the other half up for grabs."""
     if board["status"] != "open" or not board.get("bb"):
         return []
-    return [(f"d{d}", f"Digit {d}") for d in range(10)
-            if (c := board["digits"][str(d)]) and c["user_id"] == uid and c.get("via") == "claim"
-            and not c.get("chop") and not c.get("chop_open")]
+    return [(f"d{d}", f"Digit {d}") for d in open_digits(board)]
+
+
+def take_half(board: dict, uid: str, name: str, d: int) -> dict | None:
+    """Claim half of an open digit: pays half the digit price now; the other half stays open to chop."""
+    if board["status"] != "open" or board["digits"][str(d)] or not board.get("bb"):
+        return None
+    half = chop_share(board)
+    charge(board, uid, half, "digit", str(d))
+    board["digits"][str(d)] = {"user_id": str(uid), "name": name, "via": "claim", "chop_open": True, "paid": half}
+    return board["digits"][str(d)]
+
+
+def settle_open_chops(board: dict) -> list[int]:
+    """At lock time a half-taken digit belongs to its owner outright: they're charged the other half."""
+    done = []
+    for d in range(10):
+        c = board["digits"][str(d)]
+        if c and c.get("chop_open") and not c.get("chop"):
+            rest = board["digit_cost"] - c.get("paid", board["digit_cost"] - chop_share(board))
+            if rest > 0:
+                charge(board, c["user_id"], rest, "digit", str(d))
+            c["chop_open"] = False
+            c.pop("paid", None)
+            done.append(d)
+    return done
 
 
 def chop_joinable(board: dict, uid: str) -> list[tuple[str, str]]:
@@ -794,16 +817,20 @@ def offer_chop(board: dict, uid: str, d: int) -> bool:
 
 
 def join_chop(board: dict, uid: str, name: str, d: int) -> dict | None:
-    """Second player takes half of digit d: the owner's charge drops by half, the partner pays that half."""
+    """Second player takes the other half of digit d and pays what's left of the digit price."""
     c = board["digits"][str(d)]
     if not c or not c.get("chop_open") or c.get("chop") or c["user_id"] == uid or board["status"] != "open":
         return None
-    half = chop_share(board)
-    e, _ = _ledger_entry_for_digit(board, c["user_id"], d)
-    if e is not None:
-        e["amount"] = max(0, e["amount"] - half)
-    charge(board, uid, half, "chop", str(d))
-    c["chop"] = {"user_id": str(uid), "name": name}
+    dc = board["digit_cost"]
+    if "paid" not in c:      # an offered full digit: owner drops to half, partner pays the rest
+        half = chop_share(board)
+        e, _ = _ledger_entry_for_digit(board, c["user_id"], d)
+        if e is not None:
+            e["amount"] = max(0, e["amount"] - (dc - half))
+        c["paid"] = half
+    rest = max(0, dc - c["paid"])
+    charge(board, uid, rest, "chop", str(d))
+    c["chop"] = {"user_id": str(uid), "name": name, "paid": rest}
     c["chop_open"] = False
     return c
 
@@ -816,7 +843,7 @@ def digit_label(board: dict, c: dict, mention: bool = False) -> str:
     if c.get("chop"):
         text += f" 🪓 {who(c['chop'])}{sip_mark(board, c['chop']['user_id'])}"
     elif c.get("chop_open"):
-        text += " 🪓 *(chop open)*"
+        text += " 🪓 *(half open)*"
     return text
 
 
@@ -853,7 +880,7 @@ def release(board: dict, value: str) -> dict | None:
             if e["kind"] == "digit" and e["user_id"] == uid and str(n) in slots:
                 slots.remove(str(n))
                 if slots:     # an Odds/Evens claim: keep the rest of it
-                    owner_share = board["digit_cost"] - (chop_share(board) if c.get("chop") else 0)
+                    owner_share = c.get("paid", board["digit_cost"] - chop_share(board)) if (c.get("chop") or c.get("chop_open")) else board["digit_cost"]
                     e["amount"] = max(0, e["amount"] - owner_share)
                     e["slot"] = ",".join(slots)
                 else:
@@ -936,6 +963,12 @@ def lock_board(data: dict, board: dict) -> str:
             f"The satellite didn't fill ({spots_taken}/{SAT_SPOTS}), so it was cancelled and "
             f"those {TALLY_EMOJI}**{returned}** of satellite claims are void. Those digits stay unclaimed."
         )
+    settled_chops = settle_open_chops(board)
+    if settled_chops:
+        note = (note + " " if note else "") + (
+            "Half-open chop" + ("s" if len(settled_chops) > 1 else "") + " on digit"
+            + ("s " if len(settled_chops) > 1 else " ") + ", ".join(str(d) for d in settled_chops)
+            + " didn't fill, so the holder owns the whole digit and owes the other half.")
     if len(claimed_digits(board)) < 10:
         # Fill or kill: a board that isn't full at the deadline is dead. Nothing is owed, nobody can win.
         open_count = 10 - len(claimed_digits(board))
@@ -1467,7 +1500,7 @@ class ChopModal(discord.ui.Modal, title="Chop Spot(s)"):
         self.pick = discord.ui.Select(placeholder="Make a selection", min_values=1,
                                       max_values=len(options), options=options)
         self.add_item(discord.ui.Label(text="Select Spot(s) to Chop",
-                                       description=f"Each half of a chopped digit costs {half}. Pick as many as you like.",
+                                       description=f"Half a digit costs {half}. Pick as many as you like.",
                                        component=self.pick))
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -2184,16 +2217,16 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 await interaction.response.send_message(HOST_NO_PLAY, ephemeral=True)
                 return
             joinable = chop_joinable(board, uid)
-            offerable = chop_offerable(board, uid)
+            takeable = chop_takeable(board)
             half = chop_share(board)
-        if not joinable and not offerable:
-            await interaction.response.send_message(
-                "Nothing to chop: nobody's offering a digit, and you don't hold one you could offer.", ephemeral=True)
+            dc = board["digit_cost"]
+        if not joinable and not takeable:
+            await interaction.response.send_message("Every digit is fully taken. Nothing left to chop.", ephemeral=True)
             return
-        options = [discord.SelectOption(label=f"Join {lab}", value=v, emoji="🤝",
-                                        description=f"Go halves for {half} each") for v, lab in joinable]
-        options += [discord.SelectOption(label=f"Offer my {lab}", value=v, emoji="🪓",
-                                         description="Put it up; someone else can join") for v, lab in offerable]
+        options = [discord.SelectOption(label=f"{lab} · other half", value=v, emoji="🤝",
+                                        description=f"Join {lab.split('·')[-1].strip()} for {dc - half}") for v, lab in joinable]
+        options += [discord.SelectOption(label=f"{lab} · half", value=v, emoji="🪓",
+                                         description=f"Take half for {half}; the other half stays open") for v, lab in takeable]
         await interaction.response.send_modal(ChopModal(self, board_id, options[:25], half))
 
     async def _apply_chops(self, interaction: discord.Interaction, board_id: str, values: list[str]):
@@ -2211,17 +2244,19 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             for value in values:
                 d = int(value[1:])
                 c = b["digits"][str(d)]
-                if c and c["user_id"] == uid:
-                    if offer_chop(b, uid, d):
-                        done.append(f"🪓 offered digit **{d}**")
-                        announce.append(f"🪓 <@{uid}> is offering to chop digit **{d}**: tap **🪓 Chop** to go halves "
-                                        f"({TALLY_EMOJI}**{half}** each). If it hits, the 90% BB is taken and split evenly.")
+                if not c:
+                    if take_half(b, uid, user.display_name, d):
+                        done.append(f"🪓 took half of digit **{d}** for {TALLY_EMOJI}**{half}**")
+                        announce.append(f"🪓 <@{uid}> took **half of digit {d}**. The other half is open: tap **🪓 Chop** "
+                                        f"to grab it for {TALLY_EMOJI}**{b['digit_cost'] - half}**. If it hits, the 90% BB is split evenly.")
                     else:
-                        done.append(f"digit **{d}** couldn't be offered")
+                        done.append(f"digit **{d}** was just taken")
+                elif c["user_id"] == uid:
+                    done.append(f"you already hold digit **{d}**")
                 else:
                     c = join_chop(b, uid, user.display_name, d)
                     if c is not None:
-                        done.append(f"🤝 joined **{esc(c['name'])}** on digit **{d}** for {TALLY_EMOJI}**{half}**")
+                        done.append(f"🤝 joined **{esc(c['name'])}** on digit **{d}** for {TALLY_EMOJI}**{c['chop']['paid']}**")
                         announce.append(f"🪓 **Chop!** <@{uid}> joined <@{c['user_id']}> on digit **{d}**. "
                                         f"If **{d}** hits, the 90% BB is taken automatically and split down the middle.")
                     else:
