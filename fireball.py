@@ -2554,12 +2554,32 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         if not snap["ledger"]:
             await interaction.response.send_message("Nobody has claimed anything yet.", ephemeral=True)
             return
-        confirmed = sum(min(s["amount"], owed(snap, u)) for u, s in snap.get("sips", {}).items()
-                        if s["status"] == "confirmed")
         total = ticket_total(snap)
-        await interaction.response.send_message(
-            f"📋 **Expected sips:** {TALLY_EMOJI}**{fmt_num(total)}** · confirmed **{fmt_num(confirmed)}** · "
-            f"still out **{fmt_num(total - confirmed)}**\n{sip_lines(snap)}", ephemeral=True)
+        sips = snap.get("sips", {})
+        names = ticket_names(snap)
+        per: dict[str, int] = {}
+        for e in snap["ledger"]:
+            per[e["user_id"]] = per.get(e["user_id"], 0) + e["amount"]
+        confirmed = sum(min(s["amount"], per.get(u, 0)) for u, s in sips.items() if s["status"] == "confirmed")
+        rows = []
+        for uid, amt in sorted(per.items(), key=lambda kv: -kv[1]):
+            st = sips.get(uid)
+            if st and st["status"] == "confirmed":
+                mark = " ✅" if st["amount"] >= amt else f" ✅ (sipped {fmt_num(st['amount'])}, owes {fmt_num(amt - st['amount'])} more)"
+            elif st and st["status"] == "pending":
+                mark = " ⏳ waiting on you"
+            elif st and st["status"] == "denied":
+                mark = " ❌ denied"
+            else:
+                mark = ""
+            rows.append(f"<@{uid}> expected sips are: {TALLY_EMOJI}**{fmt_num(amt)}**{mark}")
+        still = [f"<@{u}>" for u, a in per.items() if not (sips.get(u) and sips[u]["status"] == "confirmed" and sips[u]["amount"] >= a)]
+        text = (f"Current total expected sips are: {TALLY_EMOJI}**{fmt_num(total)}** · confirmed **{fmt_num(confirmed)}** · "
+                f"still out **{fmt_num(total - confirmed)}**\n"
+                f"**Here's the math:**\n```\nTotal Sips: {' + '.join(ticket_terms(snap)) or '0'} = {fmt_num(total)}\n```\n"
+                f"**Expected User Sips:**\n" + "\n".join(rows)
+                + ("\n\n**Still need to sip:** " + ", ".join(still) if still else "\n\n✅ Everyone's sipped."))
+        await interaction.response.send_message(text[:1990], ephemeral=True)
 
     async def panel_close(self, interaction: discord.Interaction, board_id: str):
         await self.on_board_click(interaction, board_id, "close")
