@@ -2272,8 +2272,13 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         if not joinable and not takeable:
             await interaction.response.send_message("Every digit is fully taken. Nothing left to chop.", ephemeral=True)
             return
-        options = [discord.SelectOption(label=f"{lab} · other half", value=v, emoji="🤝",
-                                        description=f"Join {lab.split('·')[-1].strip()} for {dc - half}") for v, lab in joinable]
+        options = []
+        if len(takeable) > 1:
+            options.append(discord.SelectOption(
+                label="YOLO · half of every open digit", value="yolo", emoji="🔥",
+                description=f"Chop all {len(takeable)} open digits at once for {half * len(takeable)}"))
+        options += [discord.SelectOption(label=f"{lab} · other half", value=v, emoji="🤝",
+                                         description=f"Join {lab.split('·')[-1].strip()} for {dc - half}") for v, lab in joinable]
         options += [discord.SelectOption(label=f"{lab} · half", value=v, emoji="🪓",
                                          description=f"Take half for {half}; the other half stays open") for v, lab in takeable]
         await interaction.response.send_modal(ChopModal(self, board_id, options[:25], half))
@@ -2341,6 +2346,12 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 await interaction.response.send_message("That board isn't taking chops anymore.", ephemeral=True)
                 return
             half = chop_share(b)
+            if "yolo" in values:
+                yolo = [v for v, _ in chop_takeable(b)]
+                values = yolo + [v for v in values if v != "yolo" and v not in yolo]
+                if yolo:
+                    done.append(f"🔥 **YOLO chop** — half of {len(yolo)} open digit(s):")
+                    announce.append(f"🔥 <@{uid}> went **YOLO** and chopped every open digit!")
             for value in values:
                 d = int(value[1:])
                 c = b["digits"][str(d)]
