@@ -826,6 +826,15 @@ def take_half(board: dict, uid: str, name: str, d: int) -> dict | None:
     return board["digits"][str(d)]
 
 
+def start_sat_window(board: dict) -> bool:
+    """A chop just took a digit: if that makes 7 (half-open digits count), start the satellite grace window."""
+    if board["status"] != "open" or board.get("sat_at") or len(claimed_digits(board)) < SAT_THRESHOLD \
+            or not open_digits(board):
+        return False
+    board["sat_at"] = (datetime.now(timezone.utc) + timedelta(seconds=SAT_DELAY)).isoformat()
+    return True
+
+
 def settle_open_chops(board: dict) -> list[int]:
     """At lock time a half-taken digit belongs to its owner outright: they're charged the other half."""
     done = []
@@ -2408,6 +2417,7 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                     else:
                         done.append(f"the chop on digit **{d}** wasn't open anymore")
             closed = close_out_if_full(b)
+            opened_sat = start_sat_window(b)
             self.store.save()
             total = owed(b, uid)
             snap = json.loads(json.dumps(b))
@@ -2418,6 +2428,10 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         await self._refresh(board_id)
         if closed:
             await self._announce_closed_out(snap)
+        if opened_sat:
+            await self._say(snap, f"⏳ **7 digits are claimed! Burnin' happy!** The satellite opens in {SAT_DELAY} seconds. "
+                                  "Last chance to grab a digit on the main board.")
+            asyncio.create_task(self._open_sat_flow(board_id, delay=SAT_DELAY))
 
     async def _panel_board(self, interaction: discord.Interaction, board_id: str) -> dict | None:
         """Snapshot of the board if the presser may use host controls on it; otherwise answers them and returns None."""
