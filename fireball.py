@@ -2296,10 +2296,10 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             await interaction.response.send_message("Every digit is fully taken. Nothing left to chop.", ephemeral=True)
             return
         options = []
-        if len(takeable) > 1:
+        if takeable:
             options.append(discord.SelectOption(
-                label="YOLO · half of every open digit", value="yolo", emoji="🔥",
-                description=f"Chop all {len(takeable)} open digits at once for {half * len(takeable)}"))
+                label="YOLO · random half", value="yolo", emoji="🔥",
+                description=f"Steve picks one open digit at random; you take half for {half}"))
         options += [discord.SelectOption(label=f"{lab} · other half", value=v, emoji="🤝",
                                          description=f"Join {lab.split('·')[-1].strip()} for {dc - half}") for v, lab in joinable]
         options += [discord.SelectOption(label=f"{lab} · half", value=v, emoji="🪓",
@@ -2370,11 +2370,16 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 return
             half = chop_share(b)
             if "yolo" in values:
-                yolo = [v for v, _ in chop_takeable(b)]
-                values = yolo + [v for v in values if v != "yolo" and v not in yolo]
-                if yolo:
-                    done.append(f"🔥 **YOLO chop** — half of {len(yolo)} open digit(s):")
-                    announce.append(f"🔥 <@{uid}> went **YOLO** and chopped every open digit!")
+                rest = [v for v in values if v != "yolo"]
+                pool = [v for v, _ in chop_takeable(b) if v not in rest]
+                if pool:
+                    pick = random.choice(pool)
+                    rest.insert(0, pick)
+                    done.append(f"🔥 **YOLO!** Steve pulled digit **{pick[1:]}** out of the hat:")
+                    announce.append(f"🔥 <@{uid}> went **YOLO** — Steve picked digit **{pick[1:]}** at random for the chop.")
+                else:
+                    done.append("🔥 YOLO: no open digit left to pick from")
+                values = rest
             for value in values:
                 d = int(value[1:])
                 c = b["digits"][str(d)]
