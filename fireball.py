@@ -221,6 +221,29 @@ THEMES["halloween3"] = dict(
         "Every horror movie starts with someone saying 'it's probably nothing.' Your digit is probably nothing.",
     ],
 )
+# Game day: Fireball cheer squad.
+THEMES["cheer"] = {
+    "label": "Fireball Cheer Squad 📣",
+    "colors": {"open": 0xE53935, "satellite": 0xFFC107, "animating": 0xFF3D00,
+               "locked": 0x212121, "settled": 0xFFD54F, "cancelled": 0x616161},
+    "fire": "📣", "duck": "📣🦆", "tag": " 📣",
+    "banner": "cheer_banner.jpg",
+    "board_title": "📣 Fireball",
+    "sat_title": "📣🦆 Fireball Satellite · The Sidelines",
+    "open_line": "📣 **Fireball {code} is open!** Game day, baby. Grab your pom-poms and a digit.",
+    "sat_open_line": "📣🦆 **THE SIDELINES (satellite) for Fireball {code}** are open! Three ducks get called onto the field.",
+    "spin": "📣 **Running the halftime routine...**",
+    "race": "📣🔥 **THE DUCKS ARE GOING FOR THE END ZONE** 🔥📣",
+    "race_quip": "*Gimme a Q! Gimme a U! Quack chaos!*",
+    "settled": "🏈 **Final whistle. Burnin' happy!** The ducks still on the field:",
+    "congrats": "🏆 TOUCHDOWN! Congrats",
+    "lines": [
+        "Gimme an F! Gimme an I! Gimme a... never mind, just sip.", "Pyrotechnics on the field, pyro in the cup.",
+        "Pom-poms up, digits down.", "That routine was flawless. Your pick was not.",
+        "Halftime show's over. Back to losing, folks.", "Red, black and burnt feathers. Game day.",
+        "The squad's cheering for the ducks, not for you.", "Stunt, tumble, sip, repeat.",
+    ],
+}
 _theme_by_guild: dict[str, str] = {}     # filled from the saved config when the cog loads
 
 
@@ -3209,7 +3232,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                                 app_commands.Choice(name="Halloween 🎃", value="halloween"),
                                 app_commands.Choice(name="Halloween After Dark 🎃🔥", value="halloween2"),
                                 app_commands.Choice(name="Halloween Slasher Night 🔪", value="halloween3"),
-                                app_commands.Choice(name="Husker Volleyball 🏐", value="husker")])
+                                app_commands.Choice(name="Husker Volleyball 🏐", value="husker"),
+                                app_commands.Choice(name="Fireball Cheer Squad 📣", value="cheer")])
     async def theme_cmd(self, interaction: discord.Interaction, look: app_commands.Choice[str] | None = None):
         if not is_admin(interaction):
             await interaction.response.send_message("Admins only.", ephemeral=True)
