@@ -108,6 +108,7 @@ DEFAULT_CONFIG = {
     "lock_minutes": 10,     # board locks this many minutes before the draw
     "theme": "normal",      # normal | halloween | halloween2 | husker (looks only; /fireball theme)
     "host_plays": True,     # may the host claim digits / satellite spots in their own game? (off for real games)
+    "smack": True,          # does Steve talk back when someone cries "rigged"? (/fireball smack)
 }
 CONFIG_LIMITS = {
     "lock_minutes": (0, 240),
@@ -2107,7 +2108,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         """Somebody in a Fireball thread cried 'rigged'. Steve has thoughts."""
         async with self.store.lock:
             board = self._board_for_channel(str(message.channel.id))
-        if not board:
+            smack = get_config(self.store.data, message.guild.id).get("smack", True)
+        if not board or not smack:
             return
         now = datetime.now(timezone.utc).timestamp()
         last = self.__dict__.setdefault("_rig_last", {})
@@ -3299,15 +3301,18 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
 
     @app_commands.command(name="config", description="Admin: show or change Fireball settings")
     @app_commands.describe(lock_minutes="Lock claims this many minutes before the draw",
-                           host_plays="Can the host claim digits/spots in their own game? (turn off for real games)")
+                           host_plays="Can the host claim digits/spots in their own game? (turn off for real games)",
+                           smack="Does Steve talk back when someone cries rigged?")
     async def config(self, interaction: discord.Interaction, lock_minutes: int | None = None,
-                     host_plays: bool | None = None):
+                     host_plays: bool | None = None, smack: bool | None = None):
         if not is_admin(interaction):
             await interaction.response.send_message("Admins only.", ephemeral=True)
             return
         changes = {} if lock_minutes is None else {"lock_minutes": lock_minutes}
         if host_plays is not None:
             changes["host_plays"] = bool(host_plays)
+        if smack is not None:
+            changes["smack"] = bool(smack)
         for k, v in changes.items():
             if k not in CONFIG_LIMITS:
                 continue
@@ -3322,6 +3327,19 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         lines = "\n".join(f"`{k}`: **{v}**" for k, v in cfg.items())
         await interaction.response.send_message(
             ("Updated.\n" if changes else "Current Fireball settings:\n") + lines, ephemeral=True)
+
+    @app_commands.command(name="smack", description="Admin: quick switch for Steve's 'rigged' comebacks")
+    @app_commands.describe(on="True = Steve talks back, False = he keeps quiet")
+    async def smack_cmd(self, interaction: discord.Interaction, on: bool):
+        if not is_admin(interaction):
+            await interaction.response.send_message("Admins only.", ephemeral=True)
+            return
+        async with self.store.lock:
+            guild_state(self.store.data, interaction.guild_id)["config"]["smack"] = bool(on)
+            self.store.save()
+        await interaction.response.send_message(
+            "🔥 Smack talk **ON**. Cry rigged at your own risk." if on else "🤐 Smack talk **OFF**. Steve's muzzled.",
+            ephemeral=True)
 
     @app_commands.command(name="theme", description="Admin: change the Fireball look (colors, emoji, Steve's lines)")
     @app_commands.describe(look="Which theme to use from now on")
