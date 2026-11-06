@@ -32,6 +32,8 @@ import asyncio
 import html as htmllib
 import io
 import json
+import os
+import urllib.parse
 import logging
 import math
 import random
@@ -58,6 +60,9 @@ BACKUP_RESULTS_URL = "https://www.lottery.net/illinois/pick-3/numbers"   # when 
 RESULT_FIRST_TRY_MIN = 4      # start looking this many minutes after the draw
 RESULT_RETRY_SECONDS = 180    # then retry about every 3 minutes
 RESULT_GIVE_UP_HOURS = 6      # then ask the host to enter it by hand
+RANDOM_ORG_KEY = os.environ.get("RANDOM_ORG_KEY", "").strip()   # set it and the satellite shuffle is drawn (and signed) by Random.org
+RANDOM_ORG_URL = "https://api.random.org/json-rpc/4/invoke"
+RANDOM_ORG_TIMEOUT = 15       # seconds; past that the shuffle falls back to the local system RNG
 
 SAT_THRESHOLD = 7             # digits claimed before the satellite opens
 SAT_SPOTS = 10
@@ -577,11 +582,13 @@ def open_satellite(board: dict) -> str | None:
     return "satellite"
 
 
-def start_animation(board: dict) -> bool:
+def start_animation(board: dict, proof: dict | None = None, proof_failed: bool = False) -> bool:
     """Preference window is over: decide the outcome (using everyone's preferences) and move to the show."""
     if board["status"] != "satellite" or not all(board["sat"]["spots"]) or board["sat"].get("outcome"):
         return False
-    board["sat"]["outcome"] = compute_outcome(board)
+    board["sat"]["outcome"] = compute_outcome(board, proof=proof)
+    if proof_failed:
+        board["sat"]["outcome"]["proof_failed"] = True
     board["status"] = "animating"
     return True
 
@@ -615,7 +622,43 @@ def spot_claim_line(board: dict, user_id: str, taken: list[int]) -> str:
             f"{TALLY_EMOJI}**{board['sat_cost']}** each, in for {TALLY_EMOJI}**{owed(board, user_id)}** — {tail}")
 
 
-def compute_outcome(board: dict, rng: random.Random | None = None) -> dict:
+async def random_org_permutation(session, n: int = SAT_SPOTS) -> dict | None:
+    """
+    Ask Random.org (Signed API) for a random ordering of the n satellite spots.
+    Returns {"perm", "serial", "time", "signature", "verify"} or None if the key is
+    missing or the request fails; "verify" is a link anyone can open to check the
+    signature against Random.org's own records.
+    """
+    if not RANDOM_ORG_KEY:
+        return None
+    body = {"jsonrpc": "2.0", "method": "generateSignedIntegers", "id": 1,
+            "params": {"apiKey": RANDOM_ORG_KEY, "n": n, "min": 0, "max": n - 1, "replacement": False,
+                       "userData": {"game": "Fireball satellite", "board": board_code_hint()}}}
+    async with session.post(RANDOM_ORG_URL, json=body, timeout=aiohttp.ClientTimeout(total=RANDOM_ORG_TIMEOUT)) as resp:
+        resp.raise_for_status()
+        payload = await resp.json()
+    if "error" in payload:
+        raise RuntimeError(f"Random.org error: {payload['error']}")
+    res = payload["result"]
+    rnd, sig = res["random"], res["signature"]
+    perm = list(rnd["data"])
+    if sorted(perm) != list(range(n)):
+        raise RuntimeError("Random.org returned something that isn't a permutation")
+    rjson = json.dumps(rnd, separators=(",", ":"))
+    verify = ("https://api.random.org/signatures/form?format=json&random=" + urllib.parse.quote(rjson, safe="")
+              + "&signature=" + urllib.parse.quote(sig, safe=""))
+    return {"perm": perm, "serial": rnd.get("serialNumber"), "time": rnd.get("completionTime"),
+            "signature": sig, "verify": verify}
+
+
+_board_code_hint = ""
+
+
+def board_code_hint() -> str:
+    return _board_code_hint
+
+
+def compute_outcome(board: dict, rng: random.Random | None = None, proof: dict | None = None) -> dict:
     """
     Decide everything up front, fully at random, and store it. The shuffle
     rounds and the elimination order are only a show; the survivors are what
@@ -624,18 +667,27 @@ def compute_outcome(board: dict, rng: random.Random | None = None) -> dict:
     one if their picks are gone or they set none). Saving this first also means
     a restart in the middle of the animation can still finish the game.
     """
-    rng = rng or random.SystemRandom()
     reserved = list(board["sat"]["reserved"])
     spots = board["sat"].get("spots") or []
     prefs = board["sat"].get("prefs") or {}
     n = SAT_SPOTS
     k = len(reserved)
+    if proof:
+        # Random.org drew the ordering: the first n-k spots burn (in that order), the rest survive,
+        # and survivors pick digits in the order Random.org listed them. Everything else that
+        # still needs randomness is seeded from the signature, so it's fixed by that draw too.
+        perm = list(proof["perm"])
+        elim_order = perm[: n - k]
+        winners = sorted(perm[n - k:])
+        order = perm[n - k:]
+        rng = random.Random(proof["signature"])
+    else:
+        rng = rng or random.SystemRandom()
+        elim_order = rng.sample(range(n), n)[: n - k]
+        winners = [i for i in range(n) if i not in elim_order]
+        order = winners[:]
+        rng.shuffle(order)             # random priority for who picks first
     rounds = [rng.sample(range(n), n) for _ in range(rng.randint(MIN_ROUNDS, MAX_ROUNDS))]
-    elim_order = rng.sample(range(n), n)[: n - k]
-    winners = [i for i in range(n) if i not in elim_order]
-
-    order = winners[:]
-    rng.shuffle(order)             # random priority for who picks first
     remaining = reserved[:]
     assignment: dict[str, int] = {}
     how: dict[str, str] = {}
@@ -656,6 +708,7 @@ def compute_outcome(board: dict, rng: random.Random | None = None) -> dict:
         "assignment": assignment,
         "how": how,
         "applied": False,
+        "proof": {"serial": proof["serial"], "time": proof["time"], "verify": proof["verify"]} if proof else None,
     }
 
 
@@ -2280,8 +2333,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
             if ch is None:
                 continue
             try:
-                await ch.get_partial_message(int(b["notes_message_id"])).edit(
-                    content=notes_text(b, b["host_name"], info), view=notes_view(b["id"]), suppress=True)
+                msg = await ch.fetch_message(int(b["notes_message_id"]))
+                await msg.edit(content=notes_text(b, b["host_name"], info), view=notes_view(b["id"]), suppress=True)
             except discord.HTTPException:
                 pass
 
@@ -2801,13 +2854,29 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                 snap, f"🔔 **The satellite is full! Quack chaos!** The shuffle starts in **{int(wait)} seconds**. "
                       "Tap **⭐ Preferences** now to rank the open digits, before I set them on fire.")
         await asyncio.sleep(wait)
+        proof, failed = await self._random_org_proof(board_id)
         async with self.store.lock:
             b = self.store.data["boards"].get(board_id)
-            if not b or not start_animation(b):
+            if not b or not start_animation(b, proof=proof, proof_failed=failed):
                 return
             self.store.save()
         await self._refresh(board_id)
         self._start_finale(board_id, animate=True)
+
+    async def _random_org_proof(self, board_id: str) -> tuple[dict | None, bool]:
+        """(proof, failed): the Random.org draw for this satellite, or None (failed=True if a key is set but it didn't answer)."""
+        if not RANDOM_ORG_KEY:
+            return None, False
+        global _board_code_hint
+        async with self.store.lock:
+            b = self.store.data["boards"].get(board_id)
+            _board_code_hint = (b or {}).get("code") or board_id
+        try:
+            proof = await random_org_permutation(self.session)
+            return proof, proof is None
+        except Exception:
+            log.warning("Random.org draw failed; using the local RNG", exc_info=True)
+            return None, True
 
     def _start_finale(self, board_id: str, animate: bool):
         if board_id in self.tasks_running and not self.tasks_running[board_id].done():
@@ -2848,11 +2917,20 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
                     f"digit **{d}** on the Fireball board ({out.get('how', {}).get(d, 'assigned')}).")
             sat_ch = await self._sat_channel(snap)
             main_ch = await self._channel(snap)
+            proof_line = ""
+            if out.get("proof"):
+                pr = out["proof"]
+                proof_line = (f"\n🔏 **Drawn by Random.org** · serial #{pr.get('serial')} · {pr.get('time')} · "
+                              f"[verify the signature](<{pr['verify']}>)")
+            elif out.get("proof_failed"):
+                proof_line = "\n⚠️ Random.org didn't answer in time, so this shuffle used the local system RNG."
             await self._sat_say(
                 snap,
                 theme(snap)["settled"] + "\n" + "\n".join(lines) +
                 f"\n\nThe board is full. Draw at {ts(snap['draw_at'], 't')}. I'll be back with the numbers. {steve(snap)}",
             )
+            if proof_line:
+                await self._sat_say(snap, proof_line.strip())
             if sat_ch is not None and main_ch is not None and sat_ch.id != main_ch.id:
                 names = ", ".join(
                     f"**{esc(snap['sat']['spots'][idx]['name'])}**"
@@ -3171,8 +3249,8 @@ class FireballCog(commands.GroupCog, name="fireball", description="Illinois Pick
         if snap.get("notes_message_id") and ch is not None:
             try:
                 # Re-attaching the view also gives notes posted before the button existed an Edit button.
-                await ch.get_partial_message(int(snap["notes_message_id"])).edit(
-                    content=content, view=notes_view(board_id), suppress=True)
+                msg = await ch.fetch_message(int(snap["notes_message_id"]))
+                await msg.edit(content=content, view=notes_view(board_id), suppress=True)
                 await interaction.response.send_message("✅ Notes updated.", ephemeral=True)
                 return
             except discord.HTTPException:
